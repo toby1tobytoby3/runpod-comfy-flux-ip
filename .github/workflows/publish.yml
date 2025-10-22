@@ -18,23 +18,31 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # Free up space so the big base image fits
-      - name: Free disk space
-        uses: easimon/maximize-build-space@v10
         with:
-          remove-android: 'true'
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          root-reserve-mb: 1024
-          swap-size-mb: 1024
+          fetch-depth: 0
 
+      # Safer disk cleanup that does NOT move the workspace
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+          # keep: nothing
+
+      # Prove the files are here before building
       - name: Assert Dockerfile exists
         run: |
+          echo "REPO=${{ github.repository }}"
+          echo "BRANCH=${{ github.ref_name }}"
           echo "WORKSPACE=$GITHUB_WORKSPACE"
           ls -la "$GITHUB_WORKSPACE"
+          echo "--- show tree ---"
+          find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -print | sort
           test -f "$GITHUB_WORKSPACE/Dockerfile" || (echo "🚨 Dockerfile NOT FOUND at repo root"; exit 99)
 
       - name: Log in to GHCR
@@ -60,8 +68,8 @@ jobs:
       - name: Build and push (linux/amd64)
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ${{ github.workspace }}
+          file: ${{ github.workspace }}/Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
