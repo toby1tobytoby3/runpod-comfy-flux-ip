@@ -1,29 +1,16 @@
-# lean base: models come from your mounted network volume
-FROM runpod/worker-comfyui:5.5.0-base
+# Keep the same base you’ve been using (flux1-dev)
+FROM runpod/ai-api-comfy:5.5.0-flux1-dev
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+# Minimal tools
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
-# IMPORTANT: this is where the worker's ComfyUI lives
-ENV COMFYUI_ROOT=/workspace/ComfyUI
-WORKDIR ${COMFYUI_ROOT}
+# === IMPORTANT: install FLUX custom nodes where ComfyUI actually looks ===
+# ComfyUI Base/Path is /comfyui (see logs), so custom nodes must live in /comfyui/custom_nodes/*
+RUN git clone --depth=1 https://github.com/XLabs-AI/x-flux-comfyui /comfyui/custom_nodes/x-flux-comfyui \
+ && pip install --no-cache-dir -r /comfyui/custom_nodes/x-flux-comfyui/requirements.txt || true
 
-# Install XLabs nodes right where ComfyUI will load them
-RUN mkdir -p ${COMFYUI_ROOT}/custom_nodes \
- && git clone --depth 1 https://github.com/XLabs-AI/x-flux-comfyui.git ${COMFYUI_ROOT}/custom_nodes/x-flux-comfyui \
- && pip install --no-cache-dir -r ${COMFYUI_ROOT}/custom_nodes/x-flux-comfyui/requirements.txt
+# Optional: prove at build-time that the node files exist (helps debugging)
+RUN test -d /comfyui/custom_nodes/x-flux-comfyui && find /comfyui/custom_nodes -maxdepth 2 -type d -print
 
-# Optional: ControlNet preprocessors (commented)
-# RUN git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git ${COMFYUI_ROOT}/custom_nodes/comfyui_controlnet_aux \
-#  && pip install --no-cache-dir -r ${COMFYUI_ROOT}/custom_nodes/comfyui_controlnet_aux/requirements.txt
-
-# Point ComfyUI to your model volume
-ENV COMFYUI_MODEL_PATHS=/runpod-volume/models
-ENV COMFYUI_MODELS_DIR=/runpod-volume/models
-ENV WORKFLOW_DIR=${COMFYUI_ROOT}/workflows
-
-# Serverless handler shim (re-export base image handler)
-COPY handler.py /workspace/handler.py
-ENV RUNPOD_HANDLER_MODULE=/workspace/handler
+# Expose extra model paths (the base image already adds /runpod-volume/*, we keep that behavior)
+ENV COMFYUI_CUSTOM_NODE_PATH=/comfyui/custom_nodes
