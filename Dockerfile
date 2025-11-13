@@ -62,7 +62,6 @@ RUN mkdir -p /runpod-volume/models/{checkpoints,clip_vision,ip_adapter,loras}
 # ---- copy your serverless handler & shim and tell the worker where to find it ----
 # (keep filenames the same as in your repo)
 COPY handler.py /workspace/handler.py
-COPY handler_shim.py /workspace/handler_shim.py
 
 # The worker entrypoint uses this to import your handler module
 # If your actual handler callable is in handler.py as "handler", this is correct:
