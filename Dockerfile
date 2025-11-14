@@ -73,9 +73,13 @@ RUN mkdir -p /runpod-volume/models/{checkpoints,clip_vision,ip_adapter,loras,t5x
 
 # ---- copy your serverless handler & tell the worker where to find it ----
 COPY handler.py /workspace/handler.py
-ENV RUNPOD_HANDLER_MODULE=/workspace/handler
+
+# Make sure /workspace is on PYTHONPATH so "handler" can be imported
+ENV PYTHONPATH=/workspace:${PYTHONPATH}
+
+# This MUST be a Python module path, not a file path
+ENV RUNPOD_HANDLER_MODULE=handler
 
 # ---- (Optional but helpful) Container healthcheck: ensure nodes are registered ----
-# Will report "unhealthy" if object_info missing or the T5XXLLoader class is not present.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=10 CMD \
-  curl -sf http://127.0.0.1:8188/object_info | jq -e 'has("T5XXLLoader") and has("FluxGuidance")' || exit 1
+  curl -sf http://127.0.0.1:8188/object_info | jq -e 'has("FluxGuidance") and has("CLIPTextEncodeFlux")' || exit 1
