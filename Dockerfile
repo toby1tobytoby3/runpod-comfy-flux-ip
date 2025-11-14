@@ -71,15 +71,13 @@ ENV COMFYUI_MODELS_DIR=/runpod-volume/models
 # Standard subdirs we use (not required, but helpful for clarity)
 RUN mkdir -p /runpod-volume/models/{checkpoints,clip_vision,ip_adapter,loras,t5xxl}
 
-# ---- copy your serverless handler & tell the worker where to find it ----
-COPY handler.py /workspace/handler.py
+# Make sure Python can import from /workspace if we later add packages there
+ENV PYTHONPATH="/workspace:${PYTHONPATH}"
 
-# Make sure /workspace is on PYTHONPATH so "handler" can be imported
-ENV PYTHONPATH=/workspace:${PYTHONPATH}
-
-# This MUST be a Python module path, not a file path
-ENV RUNPOD_HANDLER_MODULE=handler
+# Override the default worker-comfyui handler with our custom one
+COPY handler.py /handler.py
 
 # ---- (Optional but helpful) Container healthcheck: ensure nodes are registered ----
+# Will report "unhealthy" if object_info missing or the T5XXLLoader class is not present.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=10 CMD \
-  curl -sf http://127.0.0.1:8188/object_info | jq -e 'has("FluxGuidance") and has("CLIPTextEncodeFlux")' || exit 1
+  curl -sf http://127.0.0.1:8188/object_info | jq -e 'has("T5XXLLoader") and has("FluxGuidance")' || exit 1
