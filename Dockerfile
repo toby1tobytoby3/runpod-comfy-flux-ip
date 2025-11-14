@@ -61,24 +61,21 @@ PY
 
 # ---- ensure ComfyUI searches both common custom-node locations ----
 ENV COMFYUI_CUSTOM_NODE_PATH=/workspace/ComfyUI/custom_nodes:/comfyui/custom_nodes
-# add /workspace so Python can import /workspace/handler.py
+# Add /workspace so Python can import /handler.py as module "handler"
 ENV PYTHONPATH=/workspace:/workspace/ComfyUI/custom_nodes:/comfyui/custom_nodes:${PYTHONPATH}
 
 # ---- point models to the RunPod network volume ----
-# (this matches what we see in the logs: /runpod-volume/models/...)
 ENV COMFYUI_MODEL_PATHS=/runpod-volume/models
 ENV COMFYUI_MODELS_DIR=/runpod-volume/models
 
-# Standard subdirs we use (not required, but helpful for clarity)
-RUN mkdir -p /runpod-volume/models/{checkpoints,clip_vision,ip_adapter,loras,t5xxl,clip,vae}
+# Standard subdirs we use (not strictly required, but safe)
+RUN mkdir -p /runpod-volume/models/{checkpoints,clip,clip_vision,vae,ip_adapter,loras,t5xxl}
 
 # ---- copy your serverless handler & tell the worker where to find it ----
-# Put handler as /handler.py and reference it as module "handler"
+# Put handler at the top level and reference it as Python module "handler"
 COPY handler.py /handler.py
 ENV RUNPOD_HANDLER_MODULE=handler
 
-# ---- Simplified healthcheck: just verify ComfyUI is up ----
+# ---- simple healthcheck: just verify ComfyUI is up ----
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=10 CMD \
   curl -sf http://127.0.0.1:8188/object_info || exit 1
-
-
