@@ -1,12 +1,12 @@
 # Serverless handler for Runpod + ComfyUI (headless).
-# Supports: ping | about | features | upload | generate
+# Supports: ping | about | features | preflight | upload | generate
 # - upload: accepts base64 data URIs and writes to /workspace/ComfyUI/input[/<subdir>]
 # - generate: optional validate_only; otherwise proxies to ComfyUI /prompt and polls /history
 #
 # NOTE: Base image must start ComfyUI at 127.0.0.1:8188.
 
 import os, time, json, re, base64, pathlib, typing
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 import requests
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
@@ -15,6 +15,19 @@ COMFY = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
 INPUT_DIR = "/workspace/ComfyUI/input"
 OUTPUT_DIR = "/workspace/ComfyUI/output"
+
+# Minimal set of nodes the FLUX graph expects on your worker
+REQUIRED_NODES = {
+    "CheckpointLoaderSimple",
+    "EmptyLatentImage",
+    "CLIPTextEncodeFlux",
+    "KSampler",
+    "VAEDecode",
+    "SaveImage",
+    "T5XXLLoader",     # <- the one failing on the worker
+    "CLIPLoader",
+    "FluxGuidance",
+}
 
 DATA_URI_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$")
 
@@ -67,9 +80,12 @@ def _features_from_object_info(obj: Dict[str, Any]) -> Dict[str, bool]:
             "LoadFluxIPAdapter", "ApplyFluxIPAdapter"
         ]),
         "lora": "LoraLoader" in keys or "LoraLoaderModelOnly" in keys,
+        "flux_core": all(k in keys for k in [
+            "T5XXLLoader", "CLIPLoader", "FluxGuidance", "CLIPTextEncodeFlux"
+        ]),
     }
 
-def _validate_minimal_graph(graph: Dict[str, Any]) -> typing.Tuple[bool, str]:
+def _validate_minimal_graph(graph: Dict[str, Any]) -> Tuple[bool, str]:
     if not isinstance(graph, dict) or "prompt" not in graph:
         return (False, "Graph must be an object with a 'prompt' field.")
     prompt = graph["prompt"]
@@ -85,10 +101,12 @@ def _validate_minimal_graph(graph: Dict[str, Any]) -> typing.Tuple[bool, str]:
     return (True, "ok")
 
 def _post_prompt(graph: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(f"{COMFY}/prompt",
-                      json=graph,
-                      headers={"Content-Type": "application/json"},
-                      timeout=60)
+    r = requests.post(
+        f"{COMFY}/prompt",
+        json=graph,
+        headers={"Content-Type": "application/json"},
+        timeout=60
+    )
     return _json(r)
 
 def _poll_history(prompt_id: str, timeout_s: int = 180) -> Dict[str, Any]:
@@ -99,18 +117,37 @@ def _poll_history(prompt_id: str, timeout_s: int = 180) -> Dict[str, Any]:
         # Comfy returns a dict keyed by prompt_id
         if isinstance(j, dict) and prompt_id in j:
             hist = j[prompt_id]
-            # consider done when "outputs" exists (success) or "status" has error
+            # consider done when "outputs" exists (success)
             if "outputs" in hist:
                 return {"status": "completed", "history": hist}
         if time.time() - t0 > timeout_s:
             return _err("Timeout polling history", type_="timeout", last=j)
         time.sleep(1.2)
 
+def _preflight_nodes() -> Dict[str, Any]:
+    oi = _object_info()
+    if not isinstance(oi, dict) or not oi:
+        return _err("ComfyUI /object_info unavailable", type_="comfy_unreachable", url=f"{COMFY}/object_info", response=oi)
+
+    available = set(oi.keys())
+    missing = sorted(list(REQUIRED_NODES - available))
+    return _ok({
+        "available_count": len(available),
+        "missing": missing,
+        "all_good": len(missing) == 0
+    }) if not missing else _err(
+        "Required ComfyUI nodes are missing on the worker.",
+        type_="missing_nodes",
+        missing=missing,
+        hint="Ensure FLUX custom nodes are installed and imported (see Dockerfile changes).",
+        comfy_object_info_sample=list(sorted(k for k in available if k.startswith('T') or k.startswith('C')))[:40]
+    )
+
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runpod serverless entrypoint.
     expects event["input"] with:
-      - action: "ping"|"about"|"features"|"upload"|"generate"
+      - action: "ping"|"about"|"features"|"preflight"|"upload"|"generate"
     """
     try:
         inp = (event or {}).get("input") or {}
@@ -128,12 +165,16 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 "has_object_info": isinstance(oi, dict) and bool(oi),
             })
 
-        # 3) Features: discover IP-Adapter + LoRA support
+        # 3) Features: discover IP-Adapter + LoRA + FLUX core support
         if action == "features":
             oi = _object_info()
             return _ok({"supports": _features_from_object_info(oi)})
 
-        # 4) Upload: save one or many images into /input[/subdir]
+        # 4) Preflight: explicitly verify required nodes exist (fast failure)
+        if action == "preflight":
+            return _preflight_nodes()
+
+        # 5) Upload: save one or many images into /input[/subdir]
         if action == "upload":
             files = []
             # single-file convenience
@@ -152,7 +193,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
             return _ok({"saved": files})
 
-        # 5) Generate: validate-only or full run
+        # 6) Generate: validate-only or full run
         if action == "generate":
             wf = inp.get("workflow")
             if not wf:
@@ -162,6 +203,11 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             valid, why = _validate_minimal_graph(wf if "prompt" in wf else {"prompt": wf})
             if not valid:
                 return _err(f"Invalid workflow: {why}", type_="invalid_prompt")
+
+            # Preflight the required nodes; bubble up precise missing list
+            pf = _preflight_nodes()
+            if "error" in pf:
+                return pf  # missing nodes or comfy unreachable
 
             if validate_only:
                 return _ok({"validated": True, "note": why})
