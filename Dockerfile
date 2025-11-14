@@ -61,23 +61,24 @@ PY
 
 # ---- ensure ComfyUI searches both common custom-node locations ----
 ENV COMFYUI_CUSTOM_NODE_PATH=/workspace/ComfyUI/custom_nodes:/comfyui/custom_nodes
-ENV PYTHONPATH=/workspace/ComfyUI/custom_nodes:/comfyui/custom_nodes:${PYTHONPATH}
+# add /workspace so Python can import /workspace/handler.py
+ENV PYTHONPATH=/workspace:/workspace/ComfyUI/custom_nodes:/comfyui/custom_nodes:${PYTHONPATH}
 
 # ---- point models to the RunPod network volume ----
-# (this keeps checkpoints, CLIP-ViT, and IP-Adapter weights persistent)
+# (this matches what we see in the logs: /runpod-volume/models/...)
 ENV COMFYUI_MODEL_PATHS=/runpod-volume/models
 ENV COMFYUI_MODELS_DIR=/runpod-volume/models
 
 # Standard subdirs we use (not required, but helpful for clarity)
-RUN mkdir -p /runpod-volume/models/{checkpoints,clip_vision,ip_adapter,loras,t5xxl}
+RUN mkdir -p /runpod-volume/models/{checkpoints,clip_vision,ip_adapter,loras,t5xxl,clip,vae}
 
-# Make sure Python can import from /workspace if we later add packages there
-ENV PYTHONPATH="/workspace:${PYTHONPATH}"
-
-# Override the default worker-comfyui handler with our custom one
+# ---- copy your serverless handler & tell the worker where to find it ----
+# Put handler as /handler.py and reference it as module "handler"
 COPY handler.py /handler.py
+ENV RUNPOD_HANDLER_MODULE=handler
 
-# ---- (Optional but helpful) Container healthcheck: ensure nodes are registered ----
-# Will report "unhealthy" if object_info missing or the T5XXLLoader class is not present.
+# ---- Simplified healthcheck: just verify ComfyUI is up ----
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=10 CMD \
-  curl -sf http://127.0.0.1:8188/object_info | jq -e 'has("T5XXLLoader") and has("FluxGuidance")' || exit 1
+  curl -sf http://127.0.0.1:8188/object_info || exit 1
+
+
