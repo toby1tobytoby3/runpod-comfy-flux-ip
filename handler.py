@@ -24,9 +24,10 @@ REQUIRED_NODES = {
     "KSampler",
     "VAEDecode",
     "SaveImage",
-    "T5XXLLoader",     # <- the one failing on the worker
     "CLIPLoader",
     "FluxGuidance",
+    "DualCLIPLoader",
+    "ModelSamplingFlux",  # optional but nice to assert
 }
 
 DATA_URI_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$")
