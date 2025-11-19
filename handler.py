@@ -1,5 +1,5 @@
 # Serverless handler for Runpod + ComfyUI (headless).
-# Supports: ping | about | features | preflight | upload | generate
+# Supports: ping | about | features | preflight | debug_ip_paths | upload | generate
 # - upload: accepts base64 data URIs and writes to /workspace/ComfyUI/input[/<subdir>]
 # - generate: optional validate_only; otherwise proxies to ComfyUI /prompt and polls /history
 #
@@ -118,7 +118,7 @@ def _post_prompt(graph: Dict[str, Any]) -> Dict[str, Any]:
         f"{COMFY}/prompt",
         json=graph,
         headers={"Content-Type": "application/json"},
-        timeout=60
+        timeout=60,
     )
     return _json(r)
 
@@ -154,15 +154,15 @@ def _preflight_nodes() -> Dict[str, Any]:
     return _ok({
         "available_count": len(available),
         "missing": missing,
-        "all_good": len(missing) == 0
+        "all_good": len(missing) == 0,
     }) if not missing else _err(
         "Required ComfyUI nodes are missing on the worker.",
         type_="missing_nodes",
         missing=missing,
         hint="Ensure FLUX custom nodes are installed and imported (see Dockerfile changes).",
-        comfy_object_info_sample=list(sorted(
-            k for k in available if k.startswith("T") or k.startswith("C")
-        ))[:40],
+        comfy_object_info_sample=list(
+            sorted(k for k in available if k.startswith("T") or k.startswith("C"))
+        )[:40],
     )
 
 
@@ -170,7 +170,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runpod serverless entrypoint.
     expects event["input"] with:
-      - action: "ping"|"about"|"features"|"preflight"|"upload"|"generate"
+      - action: "ping"|"about"|"features"|"preflight"|"debug_ip_paths"|"upload"|"generate"
     """
     try:
         inp = (event or {}).get("input") or {}
