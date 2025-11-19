@@ -35,6 +35,7 @@ REQUIRED_NODES = {
 
 DATA_URI_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$")
 
+
 def _ok(data: Any = None, **extra):
     out = {"ok": True}
     if data is not None:
@@ -42,8 +43,10 @@ def _ok(data: Any = None, **extra):
     out.update(extra)
     return out
 
+
 def _err(message: str, *, type_: str = "error", **extra):
     return {"error": {"type": type_, "message": message, "extra_info": extra}}
+
 
 def _json(x: requests.Response) -> Dict[str, Any]:
     try:
@@ -51,8 +54,10 @@ def _json(x: requests.Response) -> Dict[str, Any]:
     except Exception:
         return {"_raw": x.text, "_status": x.status_code}
 
+
 def _ensure_dirs(path: str):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+
 
 def _save_data_uri(filename: str, data_uri: str, subdir: str | None = None) -> str:
     m = DATA_URI_RE.match(data_uri)
@@ -73,9 +78,11 @@ def _save_data_uri(filename: str, data_uri: str, subdir: str | None = None) -> s
         f.write(data)
     return fn if not subdir else f"{subdir}/{fn}"
 
+
 def _object_info() -> Dict[str, Any]:
     r = requests.get(f"{COMFY}/object_info", timeout=10)
     return _json(r)
+
 
 def _features_from_object_info(obj: Dict[str, Any]) -> Dict[str, bool]:
     keys = set(obj.keys()) if isinstance(obj, dict) else set()
@@ -88,6 +95,7 @@ def _features_from_object_info(obj: Dict[str, Any]) -> Dict[str, bool]:
             "T5XXLLoader", "CLIPLoader", "FluxGuidance", "CLIPTextEncodeFlux"
         ]),
     }
+
 
 def _validate_minimal_graph(graph: Dict[str, Any]) -> Tuple[bool, str]:
     if not isinstance(graph, dict) or "prompt" not in graph:
@@ -104,6 +112,7 @@ def _validate_minimal_graph(graph: Dict[str, Any]) -> Tuple[bool, str]:
             return (False, f"Node {node_id} missing 'inputs'.")
     return (True, "ok")
 
+
 def _post_prompt(graph: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(
         f"{COMFY}/prompt",
@@ -112,6 +121,7 @@ def _post_prompt(graph: Dict[str, Any]) -> Dict[str, Any]:
         timeout=60
     )
     return _json(r)
+
 
 def _poll_history(prompt_id: str, timeout_s: int = 180) -> Dict[str, Any]:
     t0 = time.time()
@@ -128,10 +138,16 @@ def _poll_history(prompt_id: str, timeout_s: int = 180) -> Dict[str, Any]:
             return _err("Timeout polling history", type_="timeout", last=j)
         time.sleep(1.2)
 
+
 def _preflight_nodes() -> Dict[str, Any]:
     oi = _object_info()
     if not isinstance(oi, dict) or not oi:
-        return _err("ComfyUI /object_info unavailable", type_="comfy_unreachable", url=f"{COMFY}/object_info", response=oi)
+        return _err(
+            "ComfyUI /object_info unavailable",
+            type_="comfy_unreachable",
+            url=f"{COMFY}/object_info",
+            response=oi,
+        )
 
     available = set(oi.keys())
     missing = sorted(list(REQUIRED_NODES - available))
@@ -144,8 +160,11 @@ def _preflight_nodes() -> Dict[str, Any]:
         type_="missing_nodes",
         missing=missing,
         hint="Ensure FLUX custom nodes are installed and imported (see Dockerfile changes).",
-        comfy_object_info_sample=list(sorted(k for k in available if k.startswith('T') or k.startswith('C')))[:40]
+        comfy_object_info_sample=list(sorted(
+            k for k in available if k.startswith("T") or k.startswith("C")
+        ))[:40],
     )
+
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -178,6 +197,22 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if action == "preflight":
             return _preflight_nodes()
 
+        # 4b) Debug: check IP-Adapter-related paths on the actual worker
+        if action == "debug_ip_paths":
+            paths = [
+                "/workspace/models/checkpoints/flux1-dev.safetensors",
+                "/workspace/models/ipadapter/ip_adapter.safetensors",
+                "/workspace/models/xlabs/ipadapters/ip_adapter.safetensors",
+                "/workspace/models/clip_vision/sigclip_vision_patch14_384.safetensors",
+                "/workspace/ComfyUI/models/checkpoints/flux1-dev.safetensors",
+                "/workspace/ComfyUI/models/ipadapter/ip_adapter.safetensors",
+                "/workspace/ComfyUI/models/xlabs/ipadapters/ip_adapter.safetensors",
+                "/workspace/ComfyUI/models/clip_vision/sigclip_vision_patch14_384.safetensors",
+                "/workspace/ComfyUI/input/ip_ref.png",
+            ]
+            exists = {p: os.path.exists(p) for p in paths}
+            return _ok({"paths": exists})
+
         # 5) Upload: save one or many images into /input[/subdir]
         if action == "upload":
             files = []
@@ -193,7 +228,10 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                     saved = _save_data_uri(f["filename"], f["dataUri"], subdir)
                     files.append(saved)
             else:
-                return _err("Provide (filename,dataUri) or files[].", type_="upload_bad_request")
+                return _err(
+                    "Provide (filename,dataUri) or files[].",
+                    type_="upload_bad_request",
+                )
 
             return _ok({"saved": files})
 
@@ -201,12 +239,18 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if action == "generate":
             wf = inp.get("workflow")
             if not wf:
-                return _err("Missing 'workflow' parameter", type_="generate_bad_request")
+                return _err(
+                    "Missing 'workflow' parameter", type_="generate_bad_request"
+                )
 
             validate_only = bool(inp.get("validate_only"))
-            valid, why = _validate_minimal_graph(wf if "prompt" in wf else {"prompt": wf})
+            valid, why = _validate_minimal_graph(
+                wf if "prompt" in wf else {"prompt": wf}
+            )
             if not valid:
-                return _err(f"Invalid workflow: {why}", type_="invalid_prompt")
+                return _err(
+                    f"Invalid workflow: {why}", type_="invalid_prompt"
+                )
 
             # Preflight the required nodes; bubble up precise missing list
             pf = _preflight_nodes()
@@ -221,12 +265,16 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 wf = {"prompt": wf}
 
             # If client_id not provided, add one (helps Comfy routing)
-            wf.setdefault("client_id", f"rp_{int(time.time()*1000)}")
+            wf.setdefault("client_id", f"rp_{int(time.time() * 1000)}")
 
             sub = _post_prompt(wf)
             if "prompt_id" not in sub:
                 # Bubble up Comfy errors
-                return _err("Submission failed", type_="comfy_submit_failed", response=sub)
+                return _err(
+                    "Submission failed",
+                    type_="comfy_submit_failed",
+                    response=sub,
+                )
 
             pid = sub["prompt_id"]
             hist = _poll_history(pid)
