@@ -8,21 +8,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         jq curl wget git \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. (Optional) Install XLabs / Flux custom nodes the *supported* way
-#    If you already have them on the volume and don't need more, you can skip this.
-#    This uses the helper that the base image ships with.
+# 3. Install XLabs / Flux custom nodes the supported way
+#    (These live on the image; models live on the /workspace volume.)
 RUN comfy-node-install https://github.com/XLabs-AI/x-flux-comfyui || true
 
-# 4. DO NOT override the handler module, entrypoint, or healthcheck.
+# 4. Copy our custom RunPod handler into the image
+#    We put it in /workspace and ensure /workspace is on PYTHONPATH,
+#    so "handler:handler" can be imported.
+WORKDIR /workspace
+COPY handler.py /workspace/handler.py
+
+ENV PYTHONPATH="/workspace:${PYTHONPATH}"
+ENV RUNPOD_HANDLER_MODULE=handler:handler
+
+# 5. Do NOT override the entrypoint or healthcheck.
 #    The base image already:
 #      - runs ComfyUI
-#      - exposes the serverless handler
+#      - exposes the serverless handler loop
 #      - knows how to talk to RunPod's queue system.
 #
-#    So we DON'T set:
-#      - RUNPOD_HANDLER_MODULE
-#      - custom HEALTHCHECK
-#      - COMFYUI_MODEL_PATHS
-#
-#    Models will be picked up automatically from /workspace/models when your
+#    Models will be picked up from /workspace/models when your
 #    network volume is mounted there.
