@@ -1,3 +1,5 @@
+cd /workspace
+cat > handler.py << 'PY'
 # Serverless handler for Runpod + ComfyUI (headless).
 # Supports: ping | about | features | preflight | debug_ip_paths | upload | generate
 # - upload: accepts base64 data URIs and writes to /workspace/ComfyUI/input[/<subdir>]
@@ -285,3 +287,4 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         return _err(str(e), type_="exception")
+PY
