@@ -9,7 +9,7 @@ import os, time, json, re, base64, pathlib, typing
 from typing import Any, Dict, Tuple
 import requests
 
-print(">>> CUSTOM HANDLER: module imported OK", flush=True)
+print(">>> HELLO FROM TOBY'S CUSTOM HANDLER (build v2)", flush=True)
 
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
