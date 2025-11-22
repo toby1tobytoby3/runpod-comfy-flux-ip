@@ -15,9 +15,6 @@ RUN comfy-node-install https://github.com/XLabs-AI/x-flux-comfyui || true
 WORKDIR /workspace
 COPY handler.py /workspace/handler.py
 
-# Optional but nice for debugging: prove it's loaded
-RUN echo 'print("💡 Custom handler.py loaded successfully!", flush=True)' >> /workspace/handler.py
-
 # 5. Wire ComfyUI model and input paths to the network volume
 RUN mkdir -p /comfyui/models/xlabs \
     && ln -s /runpod-volume/models/xlabs/ipadapters /comfyui/models/xlabs/ipadapters || true \
@@ -52,9 +49,13 @@ replacement = """        # Patched to support resized vision inputs (e.g. Flux I
                     pad = pos[0:1].expand(n_tokens - n_pos, -1)
                     pos = torch.cat([pos, pad], dim=0)
         return embeds + comfy.ops.cast_to_input(pos, embeds)\n"""
-src = src.replace(needle, replacement)
-with open(path, "w", encoding="utf-8") as f: f.write(src)
+if needle in src:
+    src = src.replace(needle, replacement)
+    with open(path, "w", encoding="utf-8") as f: f.write(src)
 PY
 
-# 7. Override the entrypoint so RunPod launches OUR handler instead of the built-in one
+# 7. Install RunPod SDK (for health + job loop)
+RUN pip install --no-cache-dir runpod requests
+
+# 8. Entrypoint
 CMD ["python3", "/workspace/handler.py"]
