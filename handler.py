@@ -1,205 +1,175 @@
-# Serverless handler for Runpod + ComfyUI (headless).
-# Supports: ping | about | features | preflight | debug_ip_paths | upload | generate
-# - upload: accepts base64 data URIs and writes to /workspace/ComfyUI/input[/<subdir>]
-# - generate: optional validate_only; otherwise proxies to ComfyUI /prompt and polls /history
-#
-# NOTE: Base image must start ComfyUI at 127.0.0.1:8188.
+import os
+import time
+import json
+import logging
+import threading
+import subprocess
+from typing import Any, Dict, Optional, Tuple, List
 
-import os, time, json, re, base64, pathlib, typing
-from typing import Any, Dict, Tuple
 import requests
+import runpod
 
-print(">>> HELLO FROM TOBY'S CUSTOM HANDLER (build v2)", flush=True)
-
+# -----------------------------------------------------------------------------
+# Basic config
+# -----------------------------------------------------------------------------
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
-COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-DEFAULT_TIMEOUT = int(os.environ.get("COMFY_TIMEOUT_SECONDS", "600"))
-POLL_INTERVAL = float(os.environ.get("COMFY_POLL_INTERVAL", "2.5"))
-INPUT_DIR = os.environ.get("COMFY_INPUT_DIR", "/workspace/ComfyUI/input")
-OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output")
+INPUT_DIR = os.environ.get("INPUT_DIR", "/workspace/ComfyUI/input")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/workspace/ComfyUI/output")
+
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[handler] %(asctime)s %(levelname)s %(message)s",
+)
+
+# -----------------------------------------------------------------------------
+# ComfyUI process management
+# -----------------------------------------------------------------------------
+
+_COMFY_PROC: Optional[subprocess.Popen] = None
+_COMFY_LOCK = threading.Lock()
 
 
-def _resp(ok: bool, data: Any = None, error: str | None = None) -> Dict[str, Any]:
-    return {
-        "ok": ok,
-        "error": error,
-        "data": data,
-    }
+def _comfy_url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"http://{COMFY_HOST}:{COMFY_PORT}{path}"
 
 
-def _get_json(url: str, timeout: int = 30) -> Dict[str, Any]:
+def _is_port_open(host: str, port: int, timeout: float = 0.2) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _start_comfy_if_needed() -> None:
+    """
+    Ensure ComfyUI is running inside the container.
+
+    Our Dockerfile's CMD is now `python3 /workspace/handler.py`, so the base
+    image's default entrypoint that would normally start Comfy is bypassed.
+    We therefore spawn ComfyUI ourselves (once) and then use HTTP against it.
+    """
+    global _COMFY_PROC
+
+    with _COMFY_LOCK:
+        # If port already accepting connections, we assume Comfy is up.
+        if _is_port_open(COMFY_HOST, COMFY_PORT):
+            return
+
+        # If we have a process and it's still alive, just return; it may still
+        # be starting up and _wait_for_comfy will poll.
+        if _COMFY_PROC is not None and _COMFY_PROC.poll() is None:
+            logging.info("ComfyUI process already spawned, waiting for readiness.")
+            return
+
+        # Spawn ComfyUI
+        cmd = [
+            "python3",
+            "main.py",
+            "--listen",
+            "0.0.0.0",
+            "--port",
+            str(COMFY_PORT),
+        ]
+        logging.info("Starting ComfyUI: %s", " ".join(cmd))
+
+        # Log to /tmp/comfy.log so we can inspect via the RunPod logs if needed.
+        log_path = "/tmp/comfy.log"
+        try:
+            log_f = open(log_path, "ab")  # type: ignore[assignment]
+        except Exception:
+            log_f = subprocess.DEVNULL  # type: ignore[assignment]
+
+        try:
+            _COMFY_PROC = subprocess.Popen(
+                cmd,
+                cwd="/workspace/ComfyUI",
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+            )
+        except Exception as e:
+            logging.exception("Failed to spawn ComfyUI: %s", e)
+            raise
+
+
+def _wait_for_comfy(timeout: int = 120) -> None:
+    """
+    Wait until ComfyUI responds on /system_stats or timeout.
+    """
+    start = time.time()
+    last_err: Optional[Exception] = None
+
+    while True:
+        try:
+            r = requests.get(_comfy_url("/system_stats"), timeout=5)
+            if r.status_code == 200:
+                logging.info("ComfyUI is ready.")
+                return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+
+        if time.time() - start > timeout:
+            logging.error("Timed out waiting for ComfyUI to start.")
+            raise RuntimeError(f"Timed out waiting for ComfyUI: {last_err}")
+
+        time.sleep(2)
+
+
+def _ensure_comfy_ready() -> None:
+    """
+    Public helper: start Comfy if needed and wait for readiness.
+    Use this before any call to /system_stats, /object_info, /prompt, etc.
+    """
+    _start_comfy_if_needed()
+    _wait_for_comfy()
+
+
+# -----------------------------------------------------------------------------
+# HTTP helpers to ComfyUI
+# -----------------------------------------------------------------------------
+
+def _comfy_get(path: str, timeout: int = 30) -> requests.Response:
+    url = _comfy_url(path)
+    logging.info("GET %s", url)
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    return r.json()
+    return r
 
 
-def _post_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+def _comfy_post_json(path: str, payload: Dict[str, Any], timeout: int = 300) -> Dict[str, Any]:
+    url = _comfy_url(path)
+    logging.info("POST %s", url)
     r = requests.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
-def _list_output_images(history: Dict[str, Any]) -> list[Dict[str, Any]]:
-    """
-    Given the /history response, flatten out all images with their file paths.
-    """
-    images: list[Dict[str, Any]] = []
-    for _prompt_id, entry in history.items():
-        outputs = entry.get("outputs") or {}
-        for _node_id, node_out in outputs.items():
-            imgs = node_out.get("images") or []
-            for img in imgs:
-                images.append(img)
-    return images
+# -----------------------------------------------------------------------------
+# Action handlers
+# -----------------------------------------------------------------------------
+
+def _handle_ping(_: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "data": {"message": "pong"}}
 
 
-def _load_ip_adapter_and_clip_info() -> Dict[str, Any]:
-    """
-    Query /object_info and return what this pod thinks is valid for LoadFluxIPAdapter.
-    Useful for debugging "ip_adapter name not found" issues from the outside.
-    """
-    info = _get_json(f"{COMFY_BASE}/object_info")
-    lf = info.get("LoadFluxIPAdapter") or {}
-    req = (lf.get("input") or {}).get("required") or {}
-    return {
-        "node": lf,
-        "ipadatper": req.get("ipadatper"),
-        "clip_vision": req.get("clip_vision"),
-    }
-
-
-def _build_features() -> Dict[str, Any]:
-    """
-    Very lightweight caps that your Supabase / ImagineWorlds side can query.
-    """
-    try:
-        obj = _get_json(f"{COMFY_BASE}/object_info")
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"Failed to fetch object_info: {e}",
-        }
-
-    nodes = set(obj.keys())
-    has_flux_ip_adapter = "LoadFluxIPAdapter" in nodes
-    has_flux_unet_loader = "UNETLoader" in nodes
-    has_flux_clip = "DualCLIPLoader" in nodes
-
-    flux_nodes = {
-        "LoadFluxIPAdapter",
-        "UNETLoader",
-        "EmptySD3LatentImage",
-        "CLIPTextEncodeFlux",
-        "KSampler",
-        "VAEDecode",
-        "SaveImage",
-        "CLIPLoader",
-        "FluxGuidance",
-        "DualCLIPLoader",
-        "ModelSamplingFlux",  # optional but nice to assert
-    }
-
+def _handle_about(_: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok": True,
-        "info": {
-            "has_flux_ip_adapter": has_flux_ip_adapter,
-            "has_flux_unet_loader": has_flux_unet_loader,
-            "has_flux_clip": has_flux_clip,
-            "missing_flux_nodes": sorted(list(flux_nodes - nodes)),
-        },
-    }
-
-
-DATA_URI_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$")
-
-
-def _ok_path_under(base_dir: str, rel: str) -> pathlib.Path:
-    """
-    Ensure we only ever write inside INPUT_DIR (no ../../../ escapes).
-    """
-    base = pathlib.Path(base_dir).resolve()
-    dest = (base / rel).resolve()
-    if base not in dest.parents and base != dest:
-        raise ValueError("Invalid path (escaping base dir)")
-    return dest
-
-
-def _save_data_uri_to_file(
-    data_uri: str,
-    base_dir: str,
-    rel_path: str,
-) -> Dict[str, Any]:
-    """
-    Accept 'data:image/png;base64,...' and write to base_dir/rel_path.
-    Returns relative path from base_dir for Comfy's LoadImage usage.
-    """
-    m = DATA_URI_RE.match(data_uri)
-    if not m:
-        raise ValueError("Invalid data URI")
-
-    b64_data = m.group("b64")
-    raw = base64.b64decode(b64_data)
-
-    dest = _ok_path_under(base_dir, rel_path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "wb") as f:
-        f.write(raw)
-
-    rel = str(dest.relative_to(base_dir))
-    return {
-        "path": str(dest),
-        "relative": rel,
-        "size_bytes": len(raw),
-    }
-
-
-def _handle_upload(inp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    action = "upload"
-    input: {
-      "action": "upload",
-      "files": [
-        {
-          "data_uri": "data:image/png;base64,...",
-          "target": "ip_refs/dragon_01.png"
-        },
-        ...
-      ]
-    }
-    """
-    files = inp.get("files") or []
-    if not files:
-        return _resp(False, error="No files provided")
-
-    saved: list[Dict[str, Any]] = []
-    for idx, file_spec in enumerate(files):
-        data_uri = file_spec.get("data_uri")
-        target = file_spec.get("target") or f"upload_{idx}.png"
-        if not data_uri:
-            return _resp(False, error=f"files[{idx}].data_uri missing")
-
-        try:
-            info = _save_data_uri_to_file(data_uri, INPUT_DIR, target)
-        except Exception as e:
-            return _resp(False, error=f"Failed to save files[{idx}]: {e}")
-        saved.append(info)
-
-    return _resp(True, data={"saved": saved})
-
-
-def _handle_ping() -> Dict[str, Any]:
-    return _resp(True, data={"message": "pong"})
-
-
-def _handle_about() -> Dict[str, Any]:
-    return _resp(
-        True,
-        data={
+        "data": {
             "service": "runpod-comfy-flux-ip",
-            "version": "v2",
+            "version": "v3",
             "description": "ComfyUI Flux Dev + IP Adapter (XLabs) headless worker for ImagineWorlds",
             "env": {
                 "COMFY_HOST": COMFY_HOST,
@@ -208,161 +178,249 @@ def _handle_about() -> Dict[str, Any]:
                 "OUTPUT_DIR": OUTPUT_DIR,
             },
         },
-    )
+    }
 
 
-def _handle_preflight() -> Dict[str, Any]:
+def _handle_preflight(_: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Light-weight check that:
-      - Comfy /system_stats responds
-      - /object_info has key nodes we care about
+    Check that ComfyUI is up and return basic system stats.
     """
-    try:
-        stats = _get_json(f"{COMFY_BASE}/system_stats")
-    except Exception as e:
-        return _resp(False, error=f"Failed to call /system_stats: {e}")
-
-    features = _build_features()
-    return _resp(
-        True,
-        data={
+    _ensure_comfy_ready()
+    stats = _comfy_get("/system_stats").json()
+    return {
+        "ok": True,
+        "data": {
             "system_stats": stats,
-            "features": features,
         },
+    }
+
+
+def _handle_features(_: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Summarise key ComfyUI capabilities, especially Flux + IP adapter bits.
+    """
+    _ensure_comfy_ready()
+    info = _comfy_get("/object_info").json()
+
+    load_flux = info.get("LoadFluxIPAdapter", {})
+    lf_in = (load_flux.get("input") or {}).get("required", {})
+
+    ip_opts = lf_in.get("ipadatper") or []
+    clipv_opts = lf_in.get("clip_vision") or []
+
+    unet_req = (
+        info.get("UNETLoader", {})
+        .get("input", {})
+        .get("required", {})
+        .get("unet_name", [])
     )
 
+    dclip_input = info.get("DualCLIPLoader", {}).get("input", {})
+    dclip_req = dclip_input.get("required", {})
+    dclip_opt = dclip_input.get("optional", {})
 
-def _handle_debug_ip_paths() -> Dict[str, Any]:
-    try:
-        info = _load_ip_adapter_and_clip_info()
-        return _resp(True, data=info)
-    except Exception as e:
-        return _resp(False, error=f"Failed to query object_info: {e}")
+    return {
+        "ok": True,
+        "data": {
+            "LoadFluxIPAdapter": {
+                "ipadatper": ip_opts,
+                "clip_vision": clipv_opts,
+            },
+            "UNETLoader": {
+                "unet_name": unet_req,
+            },
+            "DualCLIPLoader": {
+                "required": dclip_req,
+                "optional": dclip_opt,
+            },
+        },
+    }
+
+
+def _handle_debug_ip_paths(_: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Specifically dump the IP adapter + CLIP vision choices from object_info.
+    """
+    _ensure_comfy_ready()
+    info = _comfy_get("/object_info").json()
+
+    lf_req = (
+        info.get("LoadFluxIPAdapter", {})
+        .get("input", {})
+        .get("required", {})
+    )
+
+    ip_vals = lf_req.get("ipadatper", [])
+    clipv_vals = lf_req.get("clip_vision", [])
+
+    return {
+        "ok": True,
+        "data": {
+            "ipadatper": ip_vals,
+            "clip_vision": clipv_vals,
+        },
+    }
+
+
+def _extract_images_from_history(history: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Given /history response, pull out image filenames + subfolders for convenience.
+    """
+    if not history:
+        return []
+
+    # history is {prompt_id: {...}}
+    _, record = next(iter(history.items()))
+    outputs = record.get("outputs") or {}
+
+    images: List[Dict[str, Any]] = []
+    for node_id, node_out in outputs.items():
+        imgs = node_out.get("images") or []
+        for img in imgs:
+            filename = img.get("filename")
+            subfolder = img.get("subfolder", "")
+            img_type = img.get("type", "output")
+            if not filename:
+                continue
+            full_path = os.path.join(OUTPUT_DIR, subfolder, filename)
+            images.append(
+                {
+                    "node": node_id,
+                    "filename": filename,
+                    "subfolder": subfolder,
+                    "type": img_type,
+                    "path": full_path,
+                }
+            )
+    return images
+
+
+def _wait_for_history(prompt_id: str, timeout: int = 600, poll_interval: float = 5.0) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Poll /history/{prompt_id} until outputs appear or we time out.
+    """
+    start = time.time()
+    last_history: Optional[Dict[str, Any]] = None
+
+    while True:
+        try:
+            h = _comfy_get(f"/history/{prompt_id}", timeout=30).json()
+            last_history = h
+            images = _extract_images_from_history(h)
+            if images:
+                return h, images
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Error polling history for %s: %s", prompt_id, e)
+
+        if time.time() - start > timeout:
+            logging.error("Timed out waiting for history for %s", prompt_id)
+            return last_history, _extract_images_from_history(last_history or {})
+
+        time.sleep(poll_interval)
 
 
 def _handle_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    action = "generate"
-
-    Expected input format (outer JSON from your client):
-    {
-      "input": {
-        "action": "generate",
-        "payload": {
-          "workflow": { ... comfy prompt json ... },
-          "validate_only": false
+    Run a full Flux+IP workflow via /prompt and wait for images to land in history.
+    Expects:
+        {
+          "action": "generate",
+          "payload": {
+            "workflow": { ... }   # standard ComfyUI workflow JSON
+          }
         }
-      }
-    }
     """
     payload = inp.get("payload") or {}
     workflow = payload.get("workflow")
-    validate_only = bool(payload.get("validate_only", False))
 
     if not workflow:
-        return _resp(False, error="Missing payload.workflow")
+        return {
+            "ok": False,
+            "error": "Missing 'payload.workflow' in input",
+        }
 
-    # If you want, you can do local validation here (assert node ids, etc.)
-    if validate_only:
-        return _resp(True, data={"validated": True})
+    _ensure_comfy_ready()
 
-    prompt_url = f"{COMFY_BASE}/prompt"
-    history_url = f"{COMFY_BASE}/history"
-
+    # POST workflow to /prompt
     try:
-        submit_resp = _post_json(prompt_url, workflow, timeout=30)
-    except Exception as e:
-        return _resp(False, error=f"Failed to POST /prompt: {e}")
+        prompt_resp = _comfy_post_json("/prompt", workflow, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        logging.exception("Error posting workflow to /prompt: %s", e)
+        return {
+            "ok": False,
+            "error": f"Failed to POST /prompt: {e}",
+        }
 
-    prompt_id = submit_resp.get("prompt_id")
+    prompt_id = prompt_resp.get("prompt_id")
+    number = prompt_resp.get("number")
+
     if not prompt_id:
-        return _resp(False, error=f"/prompt response missing prompt_id: {submit_resp}")
+        return {
+            "ok": False,
+            "error": f"/prompt did not return prompt_id: {prompt_resp}",
+        }
 
-    # Poll /history until done or timeout.
-    deadline = time.time() + DEFAULT_TIMEOUT
-    last_status: str | None = None
-    while True:
-        if time.time() > deadline:
-            return _resp(
-                False,
-                error=f"Timed out waiting for history for prompt_id={prompt_id}, last_status={last_status}",
-            )
+    # Poll /history until images appear (or timeout)
+    history, images = _wait_for_history(prompt_id)
 
-        try:
-            h = _get_json(f"{history_url}/{prompt_id}", timeout=30)
-        except Exception as e:
-            # transient network / comfy restart etc.
-            last_status = f"error: {e}"
-            time.sleep(POLL_INTERVAL)
-            continue
+    return {
+        "ok": True,
+        "data": {
+            "prompt_response": prompt_resp,
+            "prompt_id": prompt_id,
+            "number": number,
+            "images": images,
+            "history": history,
+        },
+    }
 
-        # Comfy returns {prompt_id: { "status": {...}, "outputs": {...} } }
-        entry = h.get(prompt_id)
-        if not entry:
-            last_status = "missing_entry"
-            time.sleep(POLL_INTERVAL)
-            continue
 
-        status = (entry.get("status") or {}).get("status")
-        last_status = status
-
-        if status in ("success", "error", "failed"):
-            # We're done.
-            images = _list_output_images(h)
-            return _resp(
-                status == "success",
-                data={
-                    "prompt_id": prompt_id,
-                    "status": status,
-                    "history": h,
-                    "images": images,
-                },
-                error=None if status == "success" else f"Comfy status={status}",
-            )
-
-        time.sleep(POLL_INTERVAL)
-
+# -----------------------------------------------------------------------------
+# Main RunPod handler
+# -----------------------------------------------------------------------------
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    RunPod serverless entrypoint.
-    event is expected to be like:
-    {
-      "input": {
-        "action": "ping" | "about" | "features" | "preflight" | "debug_ip_paths" | "upload" | "generate",
-        ...
-      }
-    }
-    """
-    print(">>> handler(event) invoked", flush=True)
-    print(json.dumps({"event_preview": str(event)[:512]}, indent=2), flush=True)
+    RunPod serverless handler.
 
+    Expects event like:
+      {
+        "input": {
+          "action": "ping" | "about" | "preflight" | "features" |
+                     "debug_ip_paths" | "generate",
+          ...
+        }
+      }
+    """
     inp = event.get("input") or {}
-    action = inp.get("action") or "generate"
+    action = inp.get("action", "generate")
 
     try:
         if action == "ping":
-            return _handle_ping()
+            return _handle_ping(inp)
         if action == "about":
-            return _handle_about()
+            return _handle_about(inp)
         if action == "preflight":
-            return _handle_preflight()
+            return _handle_preflight(inp)
         if action == "features":
-            return _build_features()
+            return _handle_features(inp)
         if action == "debug_ip_paths":
-            return _handle_debug_ip_paths()
-        if action == "upload":
-            return _handle_upload(inp)
+            return _handle_debug_ip_paths(inp)
         if action == "generate":
             return _handle_generate(inp)
 
-        return _resp(False, error=f"Unknown action: {action}")
-    except Exception as e:
-        # Defensive catch-all so that we always return a JSON object, not explode the container.
-        return _resp(False, error=f"Exception in handler: {e}")
+        return {
+            "ok": False,
+            "error": f"Unknown action '{action}'",
+        }
 
-# --- RunPod serverless bootstrap ---
-import runpod
+    except Exception as e:  # noqa: BLE001
+        logging.exception("Unhandled exception in handler: %s", e)
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 
-print("💡 Custom handler.py loaded successfully!")
+
+# Required by RunPod serverless runtime
 runpod.serverless.start({"handler": handler})
