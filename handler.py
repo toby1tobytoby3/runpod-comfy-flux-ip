@@ -360,3 +360,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         # Defensive catch-all so that we always return a JSON object, not explode the container.
         return _resp(False, error=f"Exception in handler: {e}")
+
+# --- RunPod serverless bootstrap ---
+import runpod
+
+print("💡 Custom handler.py loaded successfully!")
+runpod.serverless.start({"handler": handler})
