@@ -15,15 +15,62 @@ COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-COMFY_DIR = os.getenv("COMFY_DIR", "/workspace/ComfyUI")
+# ---- Autoprobe Comfy directory ----
+# Priority:
+#   1) COMFY_DIR env if it contains main.py
+#   2) /workspace/ComfyUI if it contains main.py
+#   3) /comfyui if it contains main.py
+# Fallback: COMFY_DIR env or /workspace/ComfyUI (even if main.py missing; we'll log it)
+
+_env_comfy_dir = os.getenv("COMFY_DIR")
+_candidate_dirs = [
+    _env_comfy_dir,
+    "/workspace/ComfyUI",
+    "/comfyui",
+]
+
+COMFY_DIR: str = ""
+for d in _candidate_dirs:
+    if not d:
+        continue
+    if os.path.exists(os.path.join(d, "main.py")):
+        COMFY_DIR = d
+        break
+
+if not COMFY_DIR:
+    COMFY_DIR = _env_comfy_dir or "/workspace/ComfyUI"
+
 COMFY_PYTHON = os.getenv("COMFY_PYTHON", "python3")
 COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
 
-INPUT_DIR = os.getenv("INPUT_DIR", "/workspace/ComfyUI/input")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output")
+# Resolve input/output directories:
+# - Honour INPUT_DIR / OUTPUT_DIR env if set.
+# - Otherwise, prefer subdirs of COMFY_DIR if they exist.
+# - Fallback to /workspace/ComfyUI/input|output (old convention).
+
+_input_env = os.getenv("INPUT_DIR")
+_output_env = os.getenv("OUTPUT_DIR")
+
+if _input_env:
+    INPUT_DIR = _input_env
+else:
+    comfy_input = os.path.join(COMFY_DIR, "input")
+    if os.path.isdir(comfy_input):
+        INPUT_DIR = comfy_input
+    else:
+        INPUT_DIR = "/workspace/ComfyUI/input"
+
+if _output_env:
+    OUTPUT_DIR = _output_env
+else:
+    comfy_output = os.path.join(COMFY_DIR, "output")
+    if os.path.isdir(comfy_output):
+        OUTPUT_DIR = comfy_output
+    else:
+        OUTPUT_DIR = "/workspace/ComfyUI/output"
 
 SERVICE_NAME = "runpod-comfy-flux-ip"
-SERVICE_VERSION = "v6"
+SERVICE_VERSION = "v7"
 
 # --------------------
 # Logging
@@ -62,9 +109,12 @@ def _start_comfy() -> None:
 
     # If we already have a live process, do nothing.
     if _comfy_proc is not None and _comfy_proc.poll() is None:
+        logger.info("ComfyUI process already running (pid=%s)", _comfy_proc.pid)
         return
 
-    os.makedirs(os.path.dirname(COMFY_LOG_PATH), exist_ok=True)
+    # Ensure log directory exists.
+    log_dir = os.path.dirname(COMFY_LOG_PATH) or "/tmp"
+    os.makedirs(log_dir, exist_ok=True)
     log_file = open(COMFY_LOG_PATH, "a", buffering=1)
 
     cmd = [
@@ -112,10 +162,7 @@ def _wait_for_comfy(timeout: float = 180.0, poll_interval: float = 2.0) -> None:
             logger.info("Checking ComfyUI health at %s", url)
             resp = requests.get(url, timeout=5)
             if resp.ok:
-                logger.info(
-                    "ComfyUI is ready after %.1fs",
-                    time.time() - start,
-                )
+                logger.info("ComfyUI is ready after %.1fs", time.time() - start)
                 return
             last_err = f"HTTP {resp.status_code}"
         except Exception as e:
@@ -150,7 +197,7 @@ def _comfy_get_json(path: str, timeout: float = 30.0) -> Dict[str, Any]:
     return resp.json()
 
 
-def _comfy_post_json(path: str, payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+def _comfy_post_json(path: str, payload: Dict[str, Any], timeout: float = 60.0) -> Dict[str, Any]:
     _ensure_comfy_ready()
     url = COMFY_BASE + path
     logger.info("POST %s", url)
@@ -160,7 +207,7 @@ def _comfy_post_json(path: str, payload: Dict[str, Any], timeout: float = 30.0) 
 
 
 # --------------------
-# Action handlers
+# Action helpers
 # --------------------
 
 def _ok(data: Any = None) -> Dict[str, Any]:
@@ -171,11 +218,15 @@ def _ok(data: Any = None) -> Dict[str, Any]:
 
 def _fail(msg: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     logger.error("Action failed: %s", msg)
-    out = {"ok": False, "error": msg}
+    out: Dict[str, Any] = {"ok": False, "error": msg}
     if extra:
         out["details"] = extra
     return out
 
+
+# --------------------
+# Action handlers
+# --------------------
 
 def _handle_ping(_inp: Dict[str, Any]) -> Dict[str, Any]:
     return _ok({"message": "pong"})
@@ -267,9 +318,9 @@ def _handle_debug_ip_paths(_inp: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_dump_comfy_log(_inp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Return the tail of /tmp/comfy.log so we can debug serverless issues from your Mac.
+    Return the tail of /tmp/comfy.log so we can debug serverless issues from outside.
     """
-    lines = int(_inp.get("lines", 200))
+    lines = int(_inp.get("lines", 200)) if isinstance(_inp, dict) else 200
     try:
         with open(COMFY_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
@@ -296,6 +347,7 @@ def _handle_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     """
     payload = inp.get("payload") or {}
     workflow = payload.get("workflow") or payload.get("prompt")
+
     if not workflow:
         return _fail("generate requires payload.workflow (or payload.prompt)")
 
@@ -312,12 +364,12 @@ def _handle_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --------------------
-# Runpod handler
+# RunPod handler
 # --------------------
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Runpod entrypoint. Expects:
+    RunPod serverless entrypoint. Expects:
       event = { "input": { "action": "...", ... } }
     Returns:
       { "ok": bool, "data"?: {...}, "error"?: "..." }
@@ -346,10 +398,14 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         return _fail(f"Unknown or missing action: {action!r}")
 
     except Exception as e:
-        # Catch-all so we *always* return a JSON payload to Runpod.
+        # Catch-all so we *always* return a JSON payload to RunPod.
         logger.exception("Unhandled error in handler for action=%s", action)
         return _fail(f"unhandled error: {e.__class__.__name__}: {e}")
 
 
-# Start the Runpod worker loop.
-runpod.worker.start({"handler": handler})
+# --------------------
+# RunPod serverless bootstrap
+# --------------------
+
+# Correct entrypoint for RunPod serverless endpoints.
+runpod.serverless.start({"handler": handler})
