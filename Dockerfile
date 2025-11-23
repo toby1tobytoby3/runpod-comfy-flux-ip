@@ -15,10 +15,13 @@ RUN comfy-node-install https://github.com/XLabs-AI/x-flux-comfyui || true
 WORKDIR /workspace
 COPY handler.py /workspace/handler.py
 
-# 5. Wire ComfyUI model, input, AND output paths to the network volume
+# 5. Wire ComfyUI model + IO paths to the network volume
+#    NOTE: in the serverless endpoint, the NFS volume is mounted at /runpod-volume.
+#    In the dev pod you see the SAME volume at /workspace.
 RUN mkdir -p /comfyui/models/xlabs \
     && ln -s /runpod-volume/models/xlabs/ipadapters /comfyui/models/xlabs/ipadapters || true \
-    && mkdir -p /runpod-volume/ComfyUI/input /runpod-volume/ComfyUI/output \
+    && mkdir -p /runpod-volume/ComfyUI/input \
+    && mkdir -p /runpod-volume/ComfyUI/output \
     && rm -rf /comfyui/input /comfyui/output \
     && ln -s /runpod-volume/ComfyUI/input /comfyui/input || true \
     && ln -s /runpod-volume/ComfyUI/output /comfyui/output || true
@@ -39,12 +42,16 @@ replacement = """        # Patched to support resized vision inputs (e.g. Flux I
             old_n, new_n = patch_pos.shape[0], max(n_tokens - 1, 1)
             old_s, new_s = int(math.sqrt(old_n)), int(math.sqrt(new_n))
             if old_s * old_s == old_n and new_s * new_s == new_n:
-                patch_pos = patch_pos.reshape(1, old_s, old_s, -1).permute(0,3,1,2)
-                patch_pos = F.interpolate(patch_pos, size=(new_s,new_s), mode="bicubic", align_corners=False)
-                patch_pos = patch_pos.permute(0,2,3,1).reshape(new_n,-1)
-                pos = torch.cat([cls_pos, patch_pos], dim=0)
+                patch_pos = patch_pos.reshape(1, old_s, old_s)
+                patch_pos = F.interpolate(patch_pos.permute(0, 3, 1, 2),
+                                          size=(new_s, new_s),
+                                          mode="bicubic",
+                                          align_corners=False)
+                patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, new_n, -1)
+                pos = torch.cat([cls_pos, patch_pos], dim=1)[0]
             else:
-                if n_pos > n_tokens:
+                # simple pad / crop if shapes don't line up as a square grid
+                if n_tokens < n_pos:
                     pos = pos[:n_tokens]
                 else:
                     pad = pos[0:1].expand(n_tokens - n_pos, -1)
