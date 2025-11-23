@@ -15,14 +15,12 @@ RUN comfy-node-install https://github.com/XLabs-AI/x-flux-comfyui || true
 WORKDIR /workspace
 COPY handler.py /workspace/handler.py
 
-# 5. Wire ComfyUI model, input, and output paths to the network volume
+# 5. Wire ComfyUI model, input, AND output paths to the network volume
 RUN mkdir -p /comfyui/models/xlabs \
     && ln -s /runpod-volume/models/xlabs/ipadapters /comfyui/models/xlabs/ipadapters || true \
-    && mkdir -p /runpod-volume/ComfyUI/input \
-    && rm -rf /comfyui/input \
+    && mkdir -p /runpod-volume/ComfyUI/input /runpod-volume/ComfyUI/output \
+    && rm -rf /comfyui/input /comfyui/output \
     && ln -s /runpod-volume/ComfyUI/input /comfyui/input || true \
-    && mkdir -p /runpod-volume/ComfyUI/output \
-    && rm -rf /comfyui/output \
     && ln -s /runpod-volume/ComfyUI/output /comfyui/output || true
 
 # 6. Patch CLIP model to handle resized vision inputs (Flux IP Adapter fix)
