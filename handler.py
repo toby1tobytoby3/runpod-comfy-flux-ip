@@ -2,7 +2,7 @@ import os
 import time
 import logging
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 import runpod
@@ -70,7 +70,7 @@ else:
         OUTPUT_DIR = "/workspace/ComfyUI/output"
 
 SERVICE_NAME = "runpod-comfy-flux-ip"
-SERVICE_VERSION = "v7"
+SERVICE_VERSION = "v8"
 
 # --------------------
 # Logging
@@ -225,6 +225,77 @@ def _fail(msg: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 
 # --------------------
+# History parsing helpers
+# --------------------
+
+def _parse_history(prompt_id: str, history_json: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Normalise /history response and extract status + list of image outputs.
+
+    Returns:
+      (status_str, images)
+
+    images is a list of dicts:
+      {
+        "node_id": "...",
+        "filename": "...",
+        "subfolder": "...",
+        "type": "...",
+        "relative_path": "...",
+        "output_path": "...",
+      }
+    """
+    if not isinstance(history_json, dict):
+        return "", []
+
+    # Comfy usually returns { "<prompt_id>": { ... } }
+    data: Any = history_json.get(prompt_id)
+    if not isinstance(data, dict):
+        # Fallback: maybe the JSON is already the inner dict
+        data = history_json if "outputs" in history_json else {}
+
+    if not isinstance(data, dict):
+        return "", []
+
+    status_obj = data.get("status") or {}
+    status_str = str(
+        status_obj.get("status_str")
+        or status_obj.get("status")
+        or ""
+    )
+
+    outputs = data.get("outputs") or {}
+    images: List[Dict[str, Any]] = []
+
+    if isinstance(outputs, dict):
+        for node_id, node_outputs in outputs.items():
+            if not isinstance(node_outputs, list):
+                continue
+            for out in node_outputs:
+                if not isinstance(out, dict):
+                    continue
+                filename = out.get("filename")
+                if not filename:
+                    continue
+                subfolder = out.get("subfolder") or ""
+                img_type = out.get("type") or "image"
+                rel_path = os.path.join(subfolder, filename) if subfolder else filename
+                full_path = os.path.join(OUTPUT_DIR, rel_path)
+                images.append(
+                    {
+                        "node_id": str(node_id),
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "type": img_type,
+                        "relative_path": rel_path,
+                        "output_path": full_path,
+                    }
+                )
+
+    return status_str, images
+
+
+# --------------------
 # Action handlers
 # --------------------
 
@@ -344,6 +415,7 @@ def _handle_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
       }
 
     We forward 'workflow' directly to /prompt and return the Comfy response.
+    (History + image paths are exposed via the separate 'history' action.)
     """
     payload = inp.get("payload") or {}
     workflow = payload.get("workflow") or payload.get("prompt")
@@ -361,6 +433,47 @@ def _handle_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception("generate failed")
         return _fail(f"generate failed: {e.__class__.__name__}: {e}")
+
+
+def _handle_history(inp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fetch /history for a given prompt_id and extract image paths.
+
+    Expects:
+      {
+        "action": "history",
+        "prompt_id": "...",
+        // or
+        "payload": { "prompt_id": "..." }
+      }
+    """
+    payload = inp.get("payload") or {}
+    prompt_id = (
+        payload.get("prompt_id")
+        or payload.get("id")
+        or inp.get("prompt_id")
+        or inp.get("id")
+    )
+
+    if not prompt_id:
+        return _fail("history requires payload.prompt_id (or prompt_id)")
+
+    try:
+        hist = _comfy_get_json(f"/history/{prompt_id}", timeout=30.0)
+    except Exception as e:
+        logger.exception("history failed")
+        return _fail(f"history failed: {e.__class__.__name__}: {e}")
+
+    status_str, images = _parse_history(prompt_id, hist)
+
+    return _ok(
+        {
+            "prompt_id": prompt_id,
+            "status": status_str,
+            "images": images,
+            "raw": hist,
+        }
+    )
 
 
 # --------------------
@@ -394,6 +507,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             return _handle_dump_comfy_log(inp)
         if action == "generate":
             return _handle_generate(inp)
+        if action == "history":
+            return _handle_history(inp)
 
         return _fail(f"Unknown or missing action: {action!r}")
 
