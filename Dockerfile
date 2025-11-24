@@ -19,16 +19,9 @@ RUN mkdir -p /workspace/ComfyUI/input /workspace/ComfyUI/output && \
     ln -sf /workspace/ComfyUI/input /comfyui/input && \
     ln -sf /workspace/ComfyUI/output /comfyui/output
 
-# Model fix patches (Flux + attn_mask)
+# Safe optional patch for attn_mask only (no CLIP edits)
 RUN python - <<'PY'
 import os, re
-clip_path = "/comfyui/comfy/clip_model.py"
-if os.path.exists(clip_path):
-    src = open(clip_path).read()
-    needle = "return embeds + comfy.ops.cast_to_input(self.position_embedding.weight, embeds)"
-    if needle in src:
-        src = src.replace(needle, "# patched\n" + needle)
-        open(clip_path, "w").write(src)
 flux_path = "/comfyui/comfy/ldm/flux/layers.py"
 if os.path.exists(flux_path):
     src = open(flux_path).read()
