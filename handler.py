@@ -28,6 +28,15 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output")
 SERVICE_NAME = "runpod-comfy-flux-ip"
 SERVICE_VERSION = "v11"
 
+# Extra candidate output dirs we might want to scan
+OUTPUT_SCAN_DIRS: List[str] = list(dict.fromkeys([
+    OUTPUT_DIR,
+    "/comfyui/output",
+    "/comfyui/user",
+    "/comfyui/user/output",
+    "/workspace/ComfyUI/output",
+]))
+
 # Ensure input/output dirs exist on cold start
 for d in (INPUT_DIR, OUTPUT_DIR):
     try:
@@ -52,6 +61,7 @@ logger.info(
     INPUT_DIR,
     OUTPUT_DIR,
 )
+logger.info("OUTPUT_SCAN_DIRS=%s", OUTPUT_SCAN_DIRS)
 
 # ------------------------
 # Comfy process management
@@ -133,6 +143,57 @@ def _fail(msg: str, extra: Optional[Dict[str, Any]] = None):
     return out
 
 
+def _scan_outputs_multi() -> Dict[str, Dict[str, Any]]:
+    """
+    Scan all OUTPUT_SCAN_DIRS for image files and return a mapping:
+      full_path -> {name, path, size, mtime}
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+    for root_dir in OUTPUT_SCAN_DIRS:
+        if not root_dir or not os.path.isdir(root_dir):
+            continue
+        for root, _, names in os.walk(root_dir):
+            for n in names:
+                lower = n.lower()
+                if not lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    continue
+                path = os.path.join(root, n)
+                try:
+                    st = os.stat(path)
+                    size = st.st_size
+                    mtime = st.st_mtime
+                except OSError:
+                    size = None
+                    mtime = None
+                results[path] = {
+                    "name": n,
+                    "path": path,
+                    "size": size,
+                    "mtime": mtime,
+                }
+    return results
+
+
+def _diff_outputs(before: Dict[str, Dict[str, Any]],
+                  after: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Given two scan results, return a list of new/changed images:
+    - New paths
+    - Same path but changed mtime or size
+    """
+    changed: List[Dict[str, Any]] = []
+    for path, meta in after.items():
+        prev = before.get(path)
+        if prev is None:
+            changed.append(meta)
+        else:
+            if meta.get("size") != prev.get("size") or meta.get("mtime") != prev.get("mtime"):
+                changed.append(meta)
+    # Sort newest first by mtime
+    changed.sort(key=lambda x: (x.get("mtime") or 0), reverse=True)
+    return changed
+
+
 # ---------------
 # Action handlers
 # ---------------
@@ -148,7 +209,8 @@ def _handle_about(_: Dict[str, Any]):
         "env": {
             "COMFY_DIR": COMFY_DIR,
             "INPUT_DIR": INPUT_DIR,
-            "OUTPUT_DIR": OUTPUT_DIR
+            "OUTPUT_DIR": OUTPUT_DIR,
+            "OUTPUT_SCAN_DIRS": OUTPUT_SCAN_DIRS,
         },
     })
 
@@ -194,13 +256,23 @@ def _handle_upload_input_url(inp: Dict[str, Any]):
 
 
 def _handle_generate(inp: Dict[str, Any]):
+    """
+    Generate with Comfy and actively watch for new/changed images.
+
+    Behaviour:
+      1. Snapshot all known output dirs (OUTPUT_SCAN_DIRS) before the run.
+      2. POST workflow to /prompt.
+      3. Poll for up to WAIT_SECONDS looking for new/changed images.
+      4. Return prompt_response + any detected new_images + wait_info.
+    """
     # Ensure output dir is writable
     try:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        test = os.path.join(OUTPUT_DIR, "writecheck.txt")
-        with open(test, "w") as f:
-            f.write("ok")
-        logger.info("Writecheck passed: %s", test)
+        if OUTPUT_DIR:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            test = os.path.join(OUTPUT_DIR, "writecheck.txt")
+            with open(test, "w") as f:
+                f.write("ok")
+            logger.info("Writecheck passed: %s", test)
     except Exception as e:
         logger.error("Writecheck failed: %s", e)
 
@@ -211,14 +283,57 @@ def _handle_generate(inp: Dict[str, Any]):
 
     wf.setdefault("client_id", "flux-ip-runpod")
 
+    # Snapshot outputs before
+    before = _scan_outputs_multi()
+    logger.info("Pre-generate outputs: %d files", len(before))
+
     try:
         resp = _comfy_post_json("/prompt", wf, timeout=120.0)
-        return _ok({"prompt_response": resp})
     except Exception as e:
         return _fail(f"generate failed: {e}")
 
+    prompt_id = None
+    if isinstance(resp, dict):
+        prompt_id = resp.get("prompt_id")
 
-# ---- New helpers for debugging / inspection ----
+    # Poll for new/changed images
+    WAIT_SECONDS = int(os.getenv("GENERATE_WAIT_SECONDS", "40"))
+    POLL_INTERVAL = int(os.getenv("GENERATE_POLL_INTERVAL", "4"))
+    deadline = time.time() + WAIT_SECONDS
+
+    last_seen: Dict[str, Dict[str, Any]] = {}
+    changed: List[Dict[str, Any]] = []
+
+    while time.time() < deadline:
+        time.sleep(POLL_INTERVAL)
+        after = _scan_outputs_multi()
+        changed = _diff_outputs(before, after)
+        last_seen = after
+        if changed:
+            logger.info("Detected %d new/changed image(s) after generate", len(changed))
+            break
+
+    if not changed:
+        logger.warning(
+            "No new images detected after generate (waited %ss). before=%d after=%d",
+            WAIT_SECONDS, len(before), len(last_seen),
+        )
+
+    return _ok({
+        "prompt_response": resp,
+        "prompt_id": prompt_id,
+        "new_images": changed,
+        "wait_info": {
+            "wait_seconds": WAIT_SECONDS,
+            "poll_interval": POLL_INTERVAL,
+            "before_count": len(before),
+            "after_count": len(last_seen),
+            "output_scan_dirs": OUTPUT_SCAN_DIRS,
+        },
+    })
+
+
+# ---- Helpers for debugging / inspection ----
 
 def _handle_comfy_get(inp: Dict[str, Any]):
     """
@@ -282,6 +397,17 @@ def _handle_list_outputs(_: Dict[str, Any]):
     return _ok({"images": images})
 
 
+def _handle_list_all_outputs(_: Dict[str, Any]):
+    """
+    More exhaustive listing across OUTPUT_SCAN_DIRS, to see if Comfy is
+    writing anywhere unexpected.
+    """
+    scans = _scan_outputs_multi()
+    images = list(scans.values())
+    images.sort(key=lambda x: (x.get("mtime") or 0), reverse=True)
+    return _ok({"images": images, "scan_dirs": OUTPUT_SCAN_DIRS})
+
+
 def _handle_debug_ip_paths(_: Dict[str, Any]):
     """
     Inspect LoadFluxIPAdapter input fields from /object_info.
@@ -330,6 +456,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             return _handle_history(inp)
         if action == "list_outputs":
             return _handle_list_outputs(inp)
+        if action == "list_all_outputs":
+            return _handle_list_all_outputs(inp)
         if action == "debug_ip_paths":
             return _handle_debug_ip_paths(inp)
         return _fail(f"unknown action '{action}'")
