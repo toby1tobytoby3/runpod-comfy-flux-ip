@@ -62,31 +62,29 @@ if needle in src:
     with open(path, "w", encoding="utf-8") as f: f.write(src)
 PY
 
-# 6b. Patch DoubleStreamBlock.forward to handle attn_mask (Flux compatibility fix)
+# 6b. Patch DoubleStreamBlock.forward to accept attn_mask kwarg (Flux sampler compatibility)
 RUN python - << 'PY'
-import re, os
-path = "/comfyui/comfy/ldm/flux/model.py"
+import os, re
+
+path = "/comfyui/comfy/ldm/flux/layers.py"
 if os.path.exists(path):
     with open(path, "r", encoding="utf-8") as f:
         src = f.read()
-    # Look for the DoubleStreamBlock definition
-    if "class DoubleStreamBlock" in src and "def forward" in src:
-        pattern = r"def forward\(self, ([^\)]*)\):"
-        repl = (
-            "def forward(self, \\1, attn_mask=None):"
-        )
-        src2 = re.sub(pattern, repl, src, count=1)
-        # Add compatibility handling for attn_mask inside the method
-        if "attn_mask" not in src2.split("def forward")[1]:
-            insert = (
-                "\n        # Added patch: safely ignore attn_mask if passed by newer Comfy samplers\n"
-                "        if 'attn_mask' in kwargs:\n"
-                "            kwargs.pop('attn_mask', None)\n"
-            )
-            src2 = src2.replace("def forward", "def forward" + insert, 1)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(src2)
+
+    marker = "class DoubleStreamBlock"
+    if marker in src:
+        head, tail = src.split(marker, 1)
+        m = re.search(r"def forward\(self,([^)]*)\):", tail)
+        if m and "attn_mask" not in m.group(0):
+            orig = m.group(0)
+            # Add an attn_mask kwarg and ignore it in the body
+            new = orig[:-2] + ", attn_mask=None):"
+            tail = tail.replace(orig, new, 1)
+            patched = head + marker + tail
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(patched)
 PY
+
 
 # 7. Install RunPod SDK (for health + job loop)
 RUN pip install --no-cache-dir runpod requests
