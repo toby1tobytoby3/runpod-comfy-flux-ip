@@ -15,6 +15,7 @@ COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
+# Base defaults from image
 COMFY_DIR = os.getenv("COMFY_DIR", "/workspace/ComfyUI")
 COMFY_PYTHON = os.getenv("COMFY_PYTHON", "python3")
 COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
@@ -23,7 +24,6 @@ COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
 COMFY_DIR = os.getenv("COMFY_DIR", "/comfyui")  # revert to base image default
 INPUT_DIR = os.getenv("INPUT_DIR", "/workspace/ComfyUI/input")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output")
-
 
 SERVICE_NAME = "runpod-comfy-flux-ip"
 SERVICE_VERSION = "v11"
@@ -94,7 +94,10 @@ def _ensure_comfy_ready():
 
 
 def _comfy_get_json(path: str, timeout: float = 30.0):
+    """Internal helper: GET JSON from Comfy."""
     _ensure_comfy_ready()
+    if not path.startswith("/"):
+        path = "/" + path
     url = COMFY_BASE + path
     logger.info("GET %s", url)
     r = requests.get(url, timeout=timeout)
@@ -103,7 +106,10 @@ def _comfy_get_json(path: str, timeout: float = 30.0):
 
 
 def _comfy_post_json(path: str, payload: Dict[str, Any], timeout: float = 60.0):
+    """Internal helper: POST JSON to Comfy."""
     _ensure_comfy_ready()
+    if not path.startswith("/"):
+        path = "/" + path
     url = COMFY_BASE + path
     logger.info("POST %s", url)
     r = requests.post(url, json=payload, timeout=timeout)
@@ -212,6 +218,90 @@ def _handle_generate(inp: Dict[str, Any]):
         return _fail(f"generate failed: {e}")
 
 
+# ---- New helpers for debugging / inspection ----
+
+def _handle_comfy_get(inp: Dict[str, Any]):
+    """
+    Generic GET pass-through to Comfy, for debugging.
+    input.path: e.g. "/history/<prompt_id>" or "/object_info"
+    """
+    path = inp.get("path")
+    if not path:
+        return _fail("comfy_get requires 'path'")
+    try:
+        data = _comfy_get_json(path)
+        return _ok({"path": path, "data": data})
+    except Exception as e:
+        return _fail(f"comfy_get failed: {e}")
+
+
+def _handle_history(inp: Dict[str, Any]):
+    """
+    Convenience wrapper around /history/<prompt_id>.
+    Expects:
+      input.payload.prompt_id OR input.prompt_id
+    """
+    payload = inp.get("payload") or {}
+    prompt_id = payload.get("prompt_id") or inp.get("prompt_id")
+    if not prompt_id:
+        return _fail("history requires payload.prompt_id or prompt_id")
+    try:
+        data = _comfy_get_json(f"/history/{prompt_id}")
+        return _ok({"prompt_id": prompt_id, "history": data})
+    except Exception as e:
+        return _fail(f"history failed: {e}")
+
+
+def _handle_list_outputs(_: Dict[str, Any]):
+    """
+    List image files under OUTPUT_DIR so we can confirm what's been saved.
+    """
+    root_dir = OUTPUT_DIR or "/comfyui/output"
+    images: List[Dict[str, Any]] = []
+    if not os.path.isdir(root_dir):
+        return _ok({"images": [], "note": f"{root_dir} does not exist"})
+    for root, _, names in os.walk(root_dir):
+        for n in names:
+            lower = n.lower()
+            if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                path = os.path.join(root, n)
+                try:
+                    size = os.path.getsize(path)
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    size = None
+                    mtime = None
+                images.append({
+                    "name": n,
+                    "path": path,
+                    "size": size,
+                    "mtime": mtime,
+                })
+    # Sort newest first for convenience
+    images.sort(key=lambda x: (x["mtime"] or 0), reverse=True)
+    return _ok({"images": images})
+
+
+def _handle_debug_ip_paths(_: Dict[str, Any]):
+    """
+    Inspect LoadFluxIPAdapter input fields from /object_info.
+    Very useful to confirm ipadatper / clip_vision options.
+    """
+    try:
+        info = _comfy_get_json("/object_info")
+        lf = info.get("LoadFluxIPAdapter") or {}
+        # Extract just the key bits
+        inp = (lf.get("input") or {}).get("required") or {}
+        return _ok({
+            "LoadFluxIPAdapter": {
+                "ipadatper_field": inp.get("ipadatper"),
+                "clip_vision_field": inp.get("clip_vision"),
+            }
+        })
+    except Exception as e:
+        return _fail(f"debug_ip_paths failed: {e}")
+
+
 # -----------
 # Dispatcher
 # -----------
@@ -234,6 +324,14 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             return _handle_upload_input_url(inp)
         if action == "generate":
             return _handle_generate(inp)
+        if action == "comfy_get":
+            return _handle_comfy_get(inp)
+        if action == "history":
+            return _handle_history(inp)
+        if action == "list_outputs":
+            return _handle_list_outputs(inp)
+        if action == "debug_ip_paths":
+            return _handle_debug_ip_paths(inp)
         return _fail(f"unknown action '{action}'")
     except Exception as e:
         return _fail(f"unhandled exception: {e}")
