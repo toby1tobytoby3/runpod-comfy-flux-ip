@@ -7,6 +7,11 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 import runpod
 
+
+
+
+
+
 # --------------------
 # Basic config / paths
 # --------------------
@@ -71,6 +76,13 @@ else:
 
 SERVICE_NAME = "runpod-comfy-flux-ip"
 SERVICE_VERSION = "v8"
+
+
+-----------
+
+# Ensure Comfy output dir exists at runtime (important for serverless cold starts)
+os.makedirs(os.environ.get("OUTPUT_DIR", "/comfyui/output"), exist_ok=True)
+
 
 # --------------------
 # Logging
