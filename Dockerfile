@@ -62,6 +62,32 @@ if needle in src:
     with open(path, "w", encoding="utf-8") as f: f.write(src)
 PY
 
+# 6b. Patch DoubleStreamBlock.forward to handle attn_mask (Flux compatibility fix)
+RUN python - << 'PY'
+import re, os
+path = "/comfyui/comfy/ldm/flux/model.py"
+if os.path.exists(path):
+    with open(path, "r", encoding="utf-8") as f:
+        src = f.read()
+    # Look for the DoubleStreamBlock definition
+    if "class DoubleStreamBlock" in src and "def forward" in src:
+        pattern = r"def forward\(self, ([^\)]*)\):"
+        repl = (
+            "def forward(self, \\1, attn_mask=None):"
+        )
+        src2 = re.sub(pattern, repl, src, count=1)
+        # Add compatibility handling for attn_mask inside the method
+        if "attn_mask" not in src2.split("def forward")[1]:
+            insert = (
+                "\n        # Added patch: safely ignore attn_mask if passed by newer Comfy samplers\n"
+                "        if 'attn_mask' in kwargs:\n"
+                "            kwargs.pop('attn_mask', None)\n"
+            )
+            src2 = src2.replace("def forward", "def forward" + insert, 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src2)
+PY
+
 # 7. Install RunPod SDK (for health + job loop)
 RUN pip install --no-cache-dir runpod requests
 
