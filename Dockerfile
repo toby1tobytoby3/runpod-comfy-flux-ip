@@ -33,15 +33,40 @@ RUN mkdir -p /comfyui/models/xlabs && \
     ln -sf /runpod-volume/models/xlabs/ipadapters \
            /comfyui/models/xlabs/ipadapters || true
 
-# Safe optional patch for attn_mask only (no CLIP edits) – unchanged
+# Safe optional patch for attn_mask only (no CLIP edits) – broader search
+# This aligns DoubleStreamBlock.forward with newer Flux / attention-mask usage,
+# without changing its internals – just accepting an extra kwarg with a default.
 RUN python - <<'PY'
 import os, re
-flux_path = "/comfyui/comfy/ldm/flux/layers.py"
-if os.path.exists(flux_path):
-    src = open(flux_path).read()
-    if "attn_mask=None" not in src and "class DoubleStreamBlock" in src:
-        src = re.sub(r"def forward\(self,[^)]*\):", lambda m: m.group(0)[:-2] + ", attn_mask=None):", src, 1)
-        open(flux_path, "w").write(src)
+
+root = "/comfyui"
+patched = False
+
+for dirpath, dirnames, filenames in os.walk(root):
+    for fn in filenames:
+        if not fn.endswith(".py"):
+            continue
+        path = os.path.join(dirpath, fn)
+        try:
+            src = open(path, "r", encoding="utf-8").read()
+        except Exception:
+            continue
+        # Look for the DoubleStreamBlock class and ensure its forward can accept attn_mask
+        if "class DoubleStreamBlock" in src and "attn_mask=None" not in src:
+            new_src, n = re.subn(
+                r"def forward\\(self,[^)]*\\):",
+                lambda m: m.group(0)[:-2] + ", attn_mask=None):",
+                src,
+                count=1,
+            )
+            if n:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new_src)
+                print("Patched DoubleStreamBlock in", path)
+                patched = True
+
+if not patched:
+    print("No DoubleStreamBlock patch applied (maybe already patched).")
 PY
 
 # Final setup – unchanged
