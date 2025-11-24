@@ -215,6 +215,16 @@ def _handle_generate(inp: Dict[str, Any]):
       }
     }
     """
+    # Ensure output dir exists (runtime safety)
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        testfile = os.path.join(OUTPUT_DIR, "writecheck.txt")
+        with open(testfile, "w") as f:
+            f.write("ok")
+        logger.info("Writecheck passed: %s", testfile)
+    except Exception as e:
+        logger.error("Writecheck failed: %s", e)
+    
     payload = inp.get("payload") or {}
     wf = payload.get("workflow") or payload.get("prompt")
     if not wf:
