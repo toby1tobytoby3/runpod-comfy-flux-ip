@@ -1,69 +1,49 @@
-# 1. Base: official ComfyUI worker, no models baked in
 FROM runpod/worker-comfyui:5.5.0-base
-
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 2. Small quality-of-life tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        jq curl wget git \
-    && rm -rf /var/lib/apt/lists/*
+# Tools
+RUN apt-get update && apt-get install -y --no-install-recommends jq curl wget git && rm -rf /var/lib/apt/lists/*
 
-# 3. Install XLabs / Flux custom nodes
+# Flux custom node
 RUN comfy-node-install https://github.com/XLabs-AI/x-flux-comfyui || true
 
-# 4. Copy our custom handler into place
+# Handler
 WORKDIR /workspace
 COPY handler.py /workspace/handler.py
 
-# 4.5 Tell the handler to use the network volume for input/output
+# ✅ Keep ComfyUI in /comfyui
+ENV COMFY_DIR=/comfyui
+
+# ✅ Make handler + Comfy share the SAME IO dirs on the network volume
 ENV INPUT_DIR=/runpod-volume/ComfyUI/input
 ENV OUTPUT_DIR=/runpod-volume/ComfyUI/output
 
-# 5. Wire ComfyUI model and input paths to the network volume
-RUN mkdir -p /comfyui/models/xlabs \
-    && mkdir -p /comfyui/models/ipadapters \
-    && ln -s /runpod-volume/models/xlabs/ipadapters /comfyui/models/xlabs/ipadapters || true \
-    && ln -s /runpod-volume/models/ip_adapter/ip_adapter.safetensors \
-             /comfyui/models/ipadapters/ip_adapter.safetensors || true \
-    && mkdir -p /runpod-volume/ComfyUI/input /runpod-volume/ComfyUI/output \
-    && rm -rf /comfyui/input /comfyui/output \
-    && ln -s /runpod-volume/ComfyUI/input /comfyui/input || true \
-    && ln -s /runpod-volume/ComfyUI/output /comfyui/output || true
+RUN mkdir -p /runpod-volume/ComfyUI/input /runpod-volume/ComfyUI/output && \
+    rm -rf /comfyui/input /comfyui/output && \
+    ln -sf /runpod-volume/ComfyUI/input /comfyui/input && \
+    ln -sf /runpod-volume/ComfyUI/output /comfyui/output
 
-# 6. Patch CLIP model to handle resized vision inputs (Flux IP Adapter fix)
-RUN python - << 'PY'
-import os
-path = "/comfyui/comfy/clip_model.py"
-with open(path, "r", encoding="utf-8") as f:
-    src = f.read()
-needle = "        return embeds + comfy.ops.cast_to_input(self.position_embedding.weight, embeds)\n"
-replacement = """        # Patched to support resized vision inputs (e.g. Flux IP-Adapter)
-        pos = self.position_embedding.weight
-        if pos.shape[0] != embeds.shape[1]:
-            import math, torch, torch.nn.functional as F
-            n_tokens, n_pos = embeds.shape[1], pos.shape[0]
-            cls_pos, patch_pos = pos[:1], pos[1:]
-            old_n, new_n = patch_pos.shape[0], max(n_tokens - 1, 1)
-            old_s, new_s = int(math.sqrt(old_n)), int(math.sqrt(new_n))
-            if old_s * old_s == old_n and new_s * new_s == new_n:
-                patch_pos = patch_pos.reshape(1, old_s, old_s, -1).permute(0,3,1,2)
-                patch_pos = F.interpolate(patch_pos, size=(new_s,new_s), mode="bicubic", align_corners=False)
-                patch_pos = patch_pos.permute(0,2,3,1).reshape(new_n,-1)
-                pos = torch.cat([cls_pos, patch_pos], dim=0)
-            else:
-                if n_pos > n_tokens:
-                    pos = pos[:n_tokens]
-                else:
-                    pad = pos[0:1].expand(n_tokens - n_pos, -1)
-                    pos = torch.cat([pos, pad], dim=0)
-        return embeds + comfy.ops.cast_to_input(pos, embeds)\n"""
-if needle in src:
-    src = src.replace(needle, replacement)
-    with open(path, "w", encoding="utf-8") as f: f.write(src)
+# ✅ Expose IP-Adapter model to Comfy (for LoadFluxIPAdapter)
+RUN mkdir -p /comfyui/models/ipadapters && \
+    ln -sf /runpod-volume/models/ip_adapter/ip_adapter.safetensors \
+           /comfyui/models/ipadapters/ip_adapter.safetensors || true
+
+# (Optional: also mirror any previous xlabs/ipadapters layout if it exists)
+RUN mkdir -p /comfyui/models/xlabs && \
+    ln -sf /runpod-volume/models/xlabs/ipadapters \
+           /comfyui/models/xlabs/ipadapters || true
+
+# Safe optional patch for attn_mask only (no CLIP edits) – unchanged
+RUN python - <<'PY'
+import os, re
+flux_path = "/comfyui/comfy/ldm/flux/layers.py"
+if os.path.exists(flux_path):
+    src = open(flux_path).read()
+    if "attn_mask=None" not in src and "class DoubleStreamBlock" in src:
+        src = re.sub(r"def forward\(self,[^)]*\):", lambda m: m.group(0)[:-2] + ", attn_mask=None):", src, 1)
+        open(flux_path, "w").write(src)
 PY
 
-# 7. Install RunPod SDK (for health + job loop)
+# Final setup – unchanged
 RUN pip install --no-cache-dir runpod requests
-
-# 8. Entrypoint
 CMD ["python3", "/workspace/handler.py"]
