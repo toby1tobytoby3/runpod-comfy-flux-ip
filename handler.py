@@ -20,8 +20,10 @@ COMFY_PYTHON = os.getenv("COMFY_PYTHON", "python3")
 COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
 
 # ✅ Updated to match ComfyUI’s true runtime paths
+COMFY_DIR = os.getenv("COMFY_DIR", "/comfyui")  # revert to base image default
 INPUT_DIR = os.getenv("INPUT_DIR", "/workspace/ComfyUI/input")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/ComfyUI/output")
+
 
 SERVICE_NAME = "runpod-comfy-flux-ip"
 SERVICE_VERSION = "v11"
