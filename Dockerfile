@@ -11,11 +11,11 @@ RUN comfy-node-install https://github.com/XLabs-AI/x-flux-comfyui || true
 WORKDIR /workspace
 COPY handler.py /workspace/handler.py
 
-# ✅ Correctly align input/output to /workspace/ComfyUI
+# ✅ Keep ComfyUI in /comfyui but align inputs/outputs
+ENV COMFY_DIR=/comfyui
 ENV INPUT_DIR=/workspace/ComfyUI/input
 ENV OUTPUT_DIR=/workspace/ComfyUI/output
 RUN mkdir -p /workspace/ComfyUI/input /workspace/ComfyUI/output && \
-    rm -rf /comfyui/input /comfyui/output && \
     ln -sf /workspace/ComfyUI/input /comfyui/input && \
     ln -sf /workspace/ComfyUI/output /comfyui/output
 
