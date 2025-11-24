@@ -85,6 +85,12 @@ if os.path.exists(path):
                 f.write(patched)
 PY
 
+# 6c. Ensure input/output directories exist for both dev and serverless
+RUN mkdir -p /workspace/ComfyUI/input /workspace/ComfyUI/output && \
+    rm -rf /comfyui/input /comfyui/output && \
+    ln -sf /workspace/ComfyUI/input /comfyui/input && \
+    ln -sf /workspace/ComfyUI/output /comfyui/output
+
 
 # 7. Install RunPod SDK (for health + job loop)
 RUN pip install --no-cache-dir runpod requests
