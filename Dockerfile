@@ -39,34 +39,50 @@ RUN mkdir -p /comfyui/models/xlabs && \
 RUN python - <<'PY'
 import os, re
 
-root = "/comfyui"
-patched = False
+def patch_file(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+    except Exception:
+        return False
 
-for dirpath, dirnames, filenames in os.walk(root):
-    for fn in filenames:
-        if not fn.endswith(".py"):
-            continue
-        path = os.path.join(dirpath, fn)
-        try:
-            src = open(path, "r", encoding="utf-8").read()
-        except Exception:
-            continue
-        # Look for the DoubleStreamBlock class and ensure its forward can accept attn_mask
-        if "class DoubleStreamBlock" in src and "attn_mask=None" not in src:
-            new_src, n = re.subn(
-                r"def forward\\(self,[^)]*\\):",
-                lambda m: m.group(0)[:-2] + ", attn_mask=None):",
-                src,
-                count=1,
-            )
-            if n:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(new_src)
-                print("Patched DoubleStreamBlock in", path)
-                patched = True
+    # Only touch files that actually define DoubleStreamBlock
+    if "class DoubleStreamBlock" not in src:
+        return False
+    # Don’t double-patch
+    if "attn_mask=None" in src:
+        return False
 
-if not patched:
-    print("No DoubleStreamBlock patch applied (maybe already patched).")
+    # Add attn_mask=None to the first forward(...) we find in that class
+    new_src, n = re.subn(
+        r"def forward\(self,[^)]*\):",
+        lambda m: m.group(0)[:-2] + ", attn_mask=None):",
+        src,
+        count=1,
+    )
+    if n:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_src)
+        print("Patched DoubleStreamBlock in", path)
+        return True
+    return False
+
+roots = ["/comfyui", "/opt/venv"]
+patched_any = False
+
+for root in roots:
+    if not os.path.exists(root):
+        continue
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            full = os.path.join(dirpath, fn)
+            if patch_file(full):
+                patched_any = True
+
+if not patched_any:
+    print("No DoubleStreamBlock patch applied (maybe already patched or different layout).")
 PY
 
 # Final setup – unchanged
