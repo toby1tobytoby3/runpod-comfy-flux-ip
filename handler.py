@@ -230,7 +230,7 @@ def _handle_about(_: Dict[str, Any]) -> Dict[str, Any]:
     return _ok(
         {
             "service": "runpod-comfy-flux-ip",
-            "version": "v12",
+            "version": "v13",
             "env": {
                 "COMFY_DIR": COMFY_DIR,
                 "INPUT_DIR": INPUT_DIR,
@@ -280,9 +280,28 @@ def _handle_upload_input_url(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_dump_comfy_log(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return the tail of the Comfy log.
+
+    If COMFY_LOG_PATH doesn't exist, we fall back to scanning COMFY_DIR for
+    any comfyui.log and use the first one we find.
+    """
     lines = int(body.get("lines") or 200)
-    tail = _tail_file(COMFY_LOG_PATH, lines=lines)
-    return _ok({"log_tail": tail, "path": COMFY_LOG_PATH})
+    path = COMFY_LOG_PATH
+    tail = _tail_file(path, lines=lines)
+
+    if tail.startswith("(log file not found:"):
+        # Fallback search – base image versions sometimes move the log
+        alt_path: Optional[str] = None
+        for root, _dirs, files in os.walk(COMFY_DIR):
+            if "comfyui.log" in files:
+                alt_path = os.path.join(root, "comfyui.log")
+                break
+        if alt_path:
+            path = alt_path
+            tail = _tail_file(path, lines=lines)
+
+    return _ok({"log_tail": tail, "path": path})
 
 
 def _handle_comfy_get(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -294,24 +313,72 @@ def _handle_comfy_get(body: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         resp = _comfy_get(path)
-        data = resp.json()
+        # Try JSON, but fall back to raw text for debugging
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        return _ok({"path": path, "data": data, "raw": resp.text})
     except Exception as e:  # noqa: BLE001
         return _fail(f"comfy_get error for {path}: {e}")
-    return _ok({"path": path, "data": data})
 
 
 def _handle_history(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fetch Comfy history for a given prompt_id.
+
+    We try GET /history/{prompt_id} (newer Comfy) first. If that fails,
+    we fall back to POST /history.
+
+    Whatever happens, we return:
+      - history: parsed JSON if available, else None
+      - raw: raw response body (to see errors when JSON parsing fails)
+    """
     payload = body.get("payload") or {}
     prompt_id = payload.get("prompt_id")
     if not prompt_id:
         return _fail("history requires payload.prompt_id")
 
+    last_error: Optional[str] = None
+
+    # Try GET /history/{prompt_id}
+    try:
+        resp = _comfy_get(f"/history/{prompt_id}")
+        try:
+            data = resp.json()
+        except ValueError as e:  # not JSON
+            return _ok(
+                {
+                    "prompt_id": prompt_id,
+                    "history": None,
+                    "raw": resp.text,
+                    "parse_error": f"GET /history/{prompt_id} JSON error: {e}",
+                }
+            )
+        else:
+            return _ok({"prompt_id": prompt_id, "history": data, "raw": resp.text})
+    except Exception as e:  # noqa: BLE001
+        last_error = f"GET /history/{prompt_id} failed: {e}"
+
+    # Fallback: POST /history
     try:
         resp = _comfy_post("/history", json={"prompt_id": prompt_id})
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as e:  # not JSON
+            return _ok(
+                {
+                    "prompt_id": prompt_id,
+                    "history": None,
+                    "raw": resp.text,
+                    "parse_error": f"POST /history JSON error: {e}",
+                }
+            )
+        else:
+            return _ok({"prompt_id": prompt_id, "history": data, "raw": resp.text})
     except Exception as e:  # noqa: BLE001
-        return _fail(f"history error for {prompt_id}: {e}")
-    return _ok({"prompt_id": prompt_id, "history": data})
+        last_error = f"{last_error}; POST /history failed: {e}" if last_error else str(e)
+        return _fail(f"history error for {prompt_id}: {last_error}")
 
 
 def _handle_list_outputs(_: Dict[str, Any]) -> Dict[str, Any]:
