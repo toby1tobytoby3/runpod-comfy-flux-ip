@@ -1,564 +1,654 @@
-import os
-import time
+import json
 import logging
-import subprocess
+import os
+import pathlib
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import runpod
+import requests
+import subprocess
 
-# --------------------
-# Basic config / paths
-# --------------------
+# -------------------------------------------------------------------
+# Basic config
+# -------------------------------------------------------------------
 
 COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 
-# In the base image COMFY_DIR is /comfyui. We still allow overriding via env.
+# ComfyUI install dir inside the container
 COMFY_DIR = os.getenv("COMFY_DIR", "/comfyui")
 
-# For inputs/outputs we default to the network volume layout, but allow env overrides.
+# Python executable to run ComfyUI
+COMFY_PYTHON = os.getenv("COMFY_PYTHON", "/opt/venv/bin/python")
+
+# Where we tee ComfyUI stdout/stderr
+COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
+
+# HTTP timeout for ComfyUI requests
+COMFY_REQUEST_TIMEOUT = float(os.getenv("COMFY_REQUEST_TIMEOUT", "60.0"))
+
+# Network volume input/output (mounted by RunPod)
 INPUT_DIR = os.getenv("INPUT_DIR", "/runpod-volume/ComfyUI/input")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/runpod-volume/ComfyUI/output")
 
-# Comfy log path (for dump_comfy_log debugging helper)
-COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/comfyui/user/comfyui.log")
+# Directories we scan for new images
+OUTPUT_SCAN_DIRS: List[str] = list(
+    dict.fromkeys(
+        [
+            OUTPUT_DIR,
+            "/runpod-volume/ComfyUI/output",
+            "/comfyui/output",
+            "/comfyui/user/output",
+            "/workspace/ComfyUI/output",
+        ]
+    )
+)
 
-# Where we expect to find PNGs for list_all_outputs scanning
-OUTPUT_SCAN_DIRS: List[str] = [
-    OUTPUT_DIR,
-    "/comfyui/output",
-    "/comfyui/user/output",
-    "/comfyui/user",
-    "/workspace/ComfyUI/output",
-]
+# Ensure directories exist
+for d in [INPUT_DIR, OUTPUT_DIR]:
+    pathlib.Path(d).mkdir(parents=True, exist_ok=True)
 
-# Seconds to wait for ComfyUI to come up / complete a prompt
-COMFY_START_TIMEOUT = int(os.getenv("COMFY_START_TIMEOUT", "120"))
-COMFY_REQUEST_TIMEOUT = int(os.getenv("COMFY_REQUEST_TIMEOUT", "120"))
+for d in OUTPUT_SCAN_DIRS:
+    pathlib.Path(d).mkdir(parents=True, exist_ok=True)
 
-# --------------------
+# -------------------------------------------------------------------
 # Logging
-# --------------------
+# -------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
 logger = logging.getLogger("handler")
 
-# --------------------
+# -------------------------------------------------------------------
 # ComfyUI process management
-# --------------------
+# -------------------------------------------------------------------
 
-COMFY_PROCESS: Optional[subprocess.Popen] = None
+_comfy_process: Optional[subprocess.Popen] = None
 
 
 def _start_comfy_if_needed() -> None:
     """
-    Ensure the embedded ComfyUI process is running.
-
-    The base image's entrypoint already uses this pattern; we replicate it here
-    so serverless cold starts are robust.
+    Start ComfyUI in the background if it isn't already running.
+    Stdout/stderr are written to COMFY_LOG_PATH so we can tail them later.
     """
-    global COMFY_PROCESS
+    global _comfy_process
 
-    if COMFY_PROCESS is not None and COMFY_PROCESS.poll() is None:
+    if _comfy_process is not None and _comfy_process.poll() is None:
         return
 
-    logger.info("Starting ComfyUI process in %s", COMFY_DIR)
     cmd = [
-        "python",
-        os.path.join(COMFY_DIR, "main.py"),
+        COMFY_PYTHON,
+        "main.py",
         "--listen",
         "0.0.0.0",
         "--port",
         str(COMFY_PORT),
     ]
-    # Run in its own process group so RunPod can SIGTERM cleanly.
-    COMFY_PROCESS = subprocess.Popen(
+
+    log_path = pathlib.Path(COMFY_LOG_PATH)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("a", buffering=1)
+
+    _comfy_process = subprocess.Popen(
         cmd,
         cwd=COMFY_DIR,
+        stdout=log_file,
+        stderr=log_file,
+        text=True,
     )
 
+    logger.info("Started ComfyUI: pid=%s cmd=%s log=%s", _comfy_process.pid, cmd, COMFY_LOG_PATH)
 
-def _wait_for_comfy_ready(timeout: int = COMFY_START_TIMEOUT) -> None:
-    """
-    Poll /system_stats until ComfyUI responds or timeout.
-    """
-    deadline = time.time() + timeout
-    last_error: Optional[str] = None
 
-    while time.time() < deadline:
+def _wait_for_comfy_ready(timeout: float = 60.0) -> None:
+    """
+    Poll /system_stats until ComfyUI is ready or timeout.
+    """
+    start = time.time()
+    last_err: Optional[str] = None
+
+    while True:
         try:
             resp = requests.get(f"{COMFY_BASE}/system_stats", timeout=5)
             if resp.ok:
+                logger.info("ComfyUI /system_stats OK")
                 return
-            last_error = f"http {resp.status_code}"
+            last_err = f"HTTP {resp.status_code}"
         except Exception as e:  # noqa: BLE001
-            last_error = str(e)
-        time.sleep(1)
+            last_err = repr(e)
 
-    raise RuntimeError(f"ComfyUI not ready after {timeout}s (last_error={last_error})")
+        if time.time() - start > timeout:
+            raise RuntimeError(f"Timed out waiting for ComfyUI: last_err={last_err}")
+
+        time.sleep(1.0)
 
 
 def _ensure_comfy_ready() -> None:
+    """
+    Ensure ComfyUI process is running and answering /system_stats.
+    """
     _start_comfy_if_needed()
     _wait_for_comfy_ready()
 
 
-# --------------------
-# Small helpers
-# --------------------
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 
-def _ok(data: Dict[str, Any]) -> Dict[str, Any]:
+def _ok(data: Any) -> Dict[str, Any]:
     return {"ok": True, "data": data}
 
 
-def _fail(message: str, **extra: Any) -> Dict[str, Any]:
-    logger.error("handler failure: %s", message)
-    payload: Dict[str, Any] = {"message": message}
-    payload.update(extra)
-    return {"ok": False, "data": payload}
+def _fail(message: str, *, error: Optional[str] = None) -> Dict[str, Any]:
+    logger.error("handler error: %s", message)
+    return {"ok": False, "error": error or message}
 
 
-def _comfy_get(path: str, **kwargs: Any) -> requests.Response:
+def _comfy_get(
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> requests.Response:
     url = f"{COMFY_BASE}{path}"
-    logger.info("GET %s", url)
-    resp = requests.get(url, timeout=COMFY_REQUEST_TIMEOUT, **kwargs)
-    resp.raise_for_status()
+    resp = requests.get(url, params=params, timeout=timeout or COMFY_REQUEST_TIMEOUT)
     return resp
 
 
-def _comfy_post(path: str, json: Dict[str, Any], **kwargs: Any) -> requests.Response:
+def _comfy_post(
+    path: str,
+    *,
+    json: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> requests.Response:
     url = f"{COMFY_BASE}{path}"
-    logger.info("POST %s", url)
-    resp = requests.post(url, json=json, timeout=COMFY_REQUEST_TIMEOUT, **kwargs)
-    resp.raise_for_status()
+    resp = requests.post(url, json=json, timeout=timeout or COMFY_REQUEST_TIMEOUT)
     return resp
 
 
-def _scan_outputs(dirs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def _scan_outputs() -> List[Dict[str, Any]]:
     """
-    Scan one or more output directories for PNGs.
-
-    Returns a list of {name, path, size, mtime} sorted by mtime ascending.
+    Scan OUTPUT_SCAN_DIRS for PNG files and return metadata sorted by mtime.
     """
-    scan_dirs = dirs or [OUTPUT_DIR]
-    seen: Dict[str, Dict[str, Any]] = {}
+    images: List[Dict[str, Any]] = []
 
-    for d in scan_dirs:
-        if not d or not os.path.isdir(d):
+    for base_dir in OUTPUT_SCAN_DIRS:
+        base_path = pathlib.Path(base_dir)
+        if not base_path.exists():
             continue
-        try:
-            for name in os.listdir(d):
-                if not name.lower().endswith(".png"):
+
+        for root, _dirs, files in os.walk(base_path):
+            for fname in files:
+                if not fname.lower().endswith(".png"):
                     continue
-                path = os.path.join(d, name)
+                p = pathlib.Path(root) / fname
                 try:
-                    stat = os.stat(path)
-                except FileNotFoundError:
+                    stat = p.stat()
+                except OSError:
                     continue
-                key = f"{d}:{name}"
-                # Keep the newest mtime for duplicates in different dirs
-                info = {
-                    "name": name,
-                    "path": path,
-                    "size": stat.st_size,
-                    "mtime": int(stat.st_mtime),
-                }
-                if key not in seen or seen[key]["mtime"] < info["mtime"]:
-                    seen[key] = info
-        except FileNotFoundError:
-            continue
 
-    images = list(seen.values())
+                images.append(
+                    {
+                        "path": str(p),
+                        "name": p.name,
+                        "mtime": int(stat.st_mtime),
+                        "size": stat.st_size,
+                    }
+                )
+
     images.sort(key=lambda x: x["mtime"])
     return images
 
 
 def _await_new_outputs(
-    before: List[Dict[str, Any]],
-    wait_seconds: int = 40,
-    poll_interval: int = 4,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    before: Dict[str, int],
+    wait_seconds: float = 40.0,
+    poll_interval: float = 4.0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
-    Poll OUTPUT_SCAN_DIRS until new PNGs appear compared to `before`.
-
-    Returns (new_images, after_all_images).
+    Poll output dirs for up to wait_seconds, looking for PNGs whose
+    mtime is newer than entries in `before`.
     """
-    before_keys = {(img["path"], img["mtime"]) for img in before}
     deadline = time.time() + wait_seconds
 
-    while time.time() < deadline:
-        after = _scan_outputs(OUTPUT_SCAN_DIRS)
-        # New images = anything with a (path,mtime) not seen in `before`
-        new = [img for img in after if (img["path"], img["mtime"]) not in before_keys]
-        if new:
-            new.sort(key=lambda x: x["mtime"], reverse=True)
-            return new, after
+    while True:
+        all_images = _scan_outputs()
+        current_map = {img["path"]: img["mtime"] for img in all_images}
+
+        new_images = [
+            img
+            for img in all_images
+            if img["path"] not in before or img["mtime"] > before[img["path"]]
+        ]
+
+        if new_images:
+            return new_images, current_map
+
+        if time.time() >= deadline:
+            return [], current_map
 
         time.sleep(poll_interval)
 
-    # Timed out – return empty list plus latest snapshot
-    after = _scan_outputs(OUTPUT_SCAN_DIRS)
-    return [], after
 
-
-def _tail_file(path: str, lines: int = 200) -> str:
+def _tail_file(path: str, max_bytes: int = 8192) -> str:
     """
-    Simple tail implementation – fine for the Comfy log sizes we're dealing with.
+    Tail up to max_bytes from the end of the file at `path`.
+    Returns a friendly error string if missing/unreadable.
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read().splitlines()
-    except FileNotFoundError:
-        return f"(log file not found: {path})"
+        p = pathlib.Path(path)
+        if not p.exists():
+            return f"(log file not found: {path})"
 
-    if not content:
-        return ""
-    return "\n".join(content[-lines:])
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            chunk = f.read().decode("utf-8", errors="replace")
+        return chunk
+    except Exception as e:  # noqa: BLE001
+        return f"(error reading log file {path}: {e})"
 
 
-# --------------------
+# -------------------------------------------------------------------
 # Action handlers
-# --------------------
+# -------------------------------------------------------------------
 
-def _handle_ping(_: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_ping() -> Dict[str, Any]:
     return _ok({"message": "pong"})
 
 
-def _handle_about(_: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_about() -> Dict[str, Any]:
+    """
+    Lightweight metadata about this worker.
+    """
     return _ok(
         {
             "service": "runpod-comfy-flux-ip",
             "version": "v13",
-            "env": {
-                "COMFY_DIR": COMFY_DIR,
-                "INPUT_DIR": INPUT_DIR,
-                "OUTPUT_DIR": OUTPUT_DIR,
+            "comfy": {
+                "base_url": COMFY_BASE,
+                "dir": COMFY_DIR,
+            },
+            "paths": {
+                "input_dir": INPUT_DIR,
+                "output_dir": OUTPUT_DIR,
+                "output_scan_dirs": OUTPUT_SCAN_DIRS,
+                "comfy_log_path": COMFY_LOG_PATH,
+            },
+            "features": {
+                "ping": True,
+                "preflight": True,
+                "generate": True,
+                "ip_adapter": True,
+                "history": True,
+                "list_outputs": True,
+                "list_all_outputs": True,
+                "dump_comfy_log": True,
             },
         }
     )
 
 
-def _handle_preflight(_: Dict[str, Any]) -> Dict[str, Any]:
-    _ensure_comfy_ready()
+def _handle_preflight() -> Dict[str, Any]:
+    """
+    Ensure ComfyUI is up and return /system_stats.
+    """
     try:
+        _ensure_comfy_ready()
         resp = _comfy_get("/system_stats")
-        data = resp.json()
+        resp.raise_for_status()
+        stats = resp.json()
     except Exception as e:  # noqa: BLE001
-        return _fail(f"failed to fetch /system_stats: {e}")
-    return _ok({"system_stats": data})
+        return _fail(f"preflight failed: {e}")
+
+    return _ok({"system_stats": stats})
 
 
 def _handle_upload_input_url(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Download an image from a URL and save it to INPUT_DIR.
-
-    Request shape:
-      { "url": "...", "filename": "ip_ref.png" }
+    Download an image from a public URL and save into INPUT_DIR.
     """
-    url = body.get("url")
-    filename = body.get("filename") or "input.png"
+    payload = body.get("payload") or {}
+    url = payload.get("url")
+    filename = payload.get("filename") or "input.png"
+
     if not url:
-        return _fail("upload_input_url requires 'url'")
+        return _fail("upload_input_url requires payload.url")
 
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    dest_path = os.path.join(INPUT_DIR, filename)
+    dest = pathlib.Path(INPUT_DIR) / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Downloading %s -> %s", url, dest_path)
     try:
-        with requests.get(url, stream=True, timeout=COMFY_REQUEST_TIMEOUT) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+        logger.info("Downloading input url=%s -> %s", url, dest)
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        dest.write_bytes(resp.content)
     except Exception as e:  # noqa: BLE001
-        return _fail(f"failed to download url: {e}")
+        return _fail(f"upload_input_url failed: {e}")
 
-    return _ok({"saved": dest_path})
+    return _ok({"saved": str(dest)})
 
 
 def _handle_dump_comfy_log(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Return the tail of the Comfy log.
+    Return the tail of the ComfyUI log.
 
-    If COMFY_LOG_PATH doesn't exist, we fall back to scanning COMFY_DIR for
-    any comfyui.log and use the first one we find.
+    - First, tail COMFY_LOG_PATH (what we configure for stdout/stderr).
+    - If that file doesn't exist, we try to find a comfyui.log under COMFY_DIR.
+    - Always return a friendly string; never throw.
     """
-    lines = int(body.get("lines") or 200)
-    path = COMFY_LOG_PATH
-    tail = _tail_file(path, lines=lines)
+    payload = body.get("payload") or {}
+    lines = int(payload.get("lines") or body.get("lines") or 400)
 
-    if tail.startswith("(log file not found:"):
-        # Fallback search – base image versions sometimes move the log
+    primary_path = COMFY_LOG_PATH
+    tail = _tail_file(primary_path)
+
+    # If primary path missing, try to auto-discover comfyui.log under COMFY_DIR
+    if tail.startswith("(log file not found"):
         alt_path: Optional[str] = None
-        for root, _dirs, files in os.walk(COMFY_DIR):
-            if "comfyui.log" in files:
-                alt_path = os.path.join(root, "comfyui.log")
-                break
-        if alt_path:
-            path = alt_path
-            tail = _tail_file(path, lines=lines)
+        try:
+            for root, _dirs, files in os.walk(COMFY_DIR):
+                if "comfyui.log" in files:
+                    alt_path = os.path.join(root, "comfyui.log")
+                    break
+        except Exception:  # noqa: BLE001
+            alt_path = None
 
-    return _ok({"log_tail": tail, "path": path})
+        if alt_path:
+            tail = _tail_file(alt_path)
+            target_path = alt_path
+        else:
+            target_path = primary_path
+    else:
+        target_path = primary_path
+
+    # Trim to last N lines if needed
+    tail_lines = tail.splitlines()
+    if len(tail_lines) > lines:
+        tail = "\n".join(tail_lines[-lines:])
+
+    return _ok({"log_tail": tail, "path": target_path})
 
 
 def _handle_comfy_get(body: Dict[str, Any]) -> Dict[str, Any]:
-    path = body.get("path")
+    """
+    Passthrough GET to arbitrary ComfyUI path.
+    Use with care; primarily for debugging.
+    """
+    payload = body.get("payload") or {}
+    path = payload.get("path")
+    params = payload.get("params") or {}
+
     if not path:
-        return _fail("comfy_get requires 'path'")
-    if not path.startswith("/"):
-        path = "/" + path
+        return _fail("comfy_get requires payload.path")
 
     try:
-        resp = _comfy_get(path)
-        # Try JSON, but fall back to raw text for debugging
+        _ensure_comfy_ready()
+        resp = _comfy_get(path, params=params)
+        content_type = resp.headers.get("content-type", "")
         try:
-            data = resp.json()
-        except ValueError:
-            data = None
-        return _ok({"path": path, "data": data, "raw": resp.text})
+            parsed = resp.json()
+        except Exception:  # noqa: BLE001
+            parsed = resp.text
     except Exception as e:  # noqa: BLE001
-        return _fail(f"comfy_get error for {path}: {e}")
+        return _fail(f"comfy_get failed: {e}")
+
+    return _ok(
+        {
+            "path": path,
+            "status_code": resp.status_code,
+            "content_type": content_type,
+            "body": parsed,
+        }
+    )
 
 
 def _handle_history(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fetch Comfy history for a given prompt_id.
+    Fetch ComfyUI history for a given prompt_id.
 
-    We try GET /history/{prompt_id} (newer Comfy) first. If that fails,
-    we fall back to POST /history.
-
-    Whatever happens, we return:
-      - history: parsed JSON if available, else None
-      - raw: raw response body (to see errors when JSON parsing fails)
+    1) Try GET /history/{prompt_id} (newer API).
+    2) If that fails or returns non-JSON, fall back to POST /history.
+    3) If JSON parsing fails, return the raw text to help debugging instead
+       of failing the whole request.
     """
     payload = body.get("payload") or {}
     prompt_id = payload.get("prompt_id")
+
     if not prompt_id:
         return _fail("history requires payload.prompt_id")
 
-    last_error: Optional[str] = None
-
-    # Try GET /history/{prompt_id}
     try:
-        resp = _comfy_get(f"/history/{prompt_id}")
+        _ensure_comfy_ready()
+
+        # First try GET /history/{id}
         try:
-            data = resp.json()
-        except ValueError as e:  # not JSON
-            return _ok(
-                {
-                    "prompt_id": prompt_id,
-                    "history": None,
-                    "raw": resp.text,
-                    "parse_error": f"GET /history/{prompt_id} JSON error: {e}",
-                }
-            )
-        else:
-            return _ok({"prompt_id": prompt_id, "history": data, "raw": resp.text})
-    except Exception as e:  # noqa: BLE001
-        last_error = f"GET /history/{prompt_id} failed: {e}"
+            resp = _comfy_get(f"/history/{prompt_id}")
+            if resp.ok:
+                try:
+                    data = resp.json()
+                    return _ok({"prompt_id": prompt_id, "history": data})
+                except Exception as e:  # noqa: BLE001
+                    # Non-JSON body; return raw
+                    return _ok(
+                        {
+                            "prompt_id": prompt_id,
+                            "history": None,
+                            "raw": resp.text,
+                            "parse_error": f"GET /history/{prompt_id} JSON parse failed: {e}",
+                        }
+                    )
+        except Exception:
+            # We'll fall back to POST below
+            pass
 
-    # Fallback: POST /history
-    try:
+        # Legacy POST /history
         resp = _comfy_post("/history", json={"prompt_id": prompt_id})
+        if not resp.ok:
+            return _fail(
+                f"history POST failed: HTTP {resp.status_code} for {prompt_id}"
+            )
+
         try:
             data = resp.json()
-        except ValueError as e:  # not JSON
+            return _ok({"prompt_id": prompt_id, "history": data})
+        except Exception as e:  # noqa: BLE001
             return _ok(
                 {
                     "prompt_id": prompt_id,
                     "history": None,
                     "raw": resp.text,
-                    "parse_error": f"POST /history JSON error: {e}",
+                    "parse_error": f"POST /history JSON parse failed: {e}",
                 }
             )
-        else:
-            return _ok({"prompt_id": prompt_id, "history": data, "raw": resp.text})
+
     except Exception as e:  # noqa: BLE001
-        last_error = f"{last_error}; POST /history failed: {e}" if last_error else str(e)
-        return _fail(f"history error for {prompt_id}: {last_error}")
+        return _fail(f"history error for {prompt_id}: {e}")
 
 
-def _handle_list_outputs(_: Dict[str, Any]) -> Dict[str, Any]:
-    images = _scan_outputs([OUTPUT_DIR])
-    return _ok({"images": images})
+def _handle_list_outputs(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    List PNG files in a single directory (default: OUTPUT_DIR).
+    """
+    payload = body.get("payload") or {}
+    path = payload.get("path") or OUTPUT_DIR
+
+    root = pathlib.Path(path)
+    if not root.exists():
+        return _ok({"images": [], "path": path})
+
+    images: List[Dict[str, Any]] = []
+    for p in root.glob("*.png"):
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        images.append(
+            {
+                "path": str(p),
+                "name": p.name,
+                "mtime": int(stat.st_mtime),
+                "size": stat.st_size,
+            }
+        )
+
+    images.sort(key=lambda x: x["mtime"])
+    return _ok({"images": images, "path": path})
 
 
-def _handle_list_all_outputs(_: Dict[str, Any]) -> Dict[str, Any]:
-    images = _scan_outputs(OUTPUT_SCAN_DIRS)
+def _handle_list_all_outputs() -> Dict[str, Any]:
+    """
+    List PNG outputs across OUTPUT_SCAN_DIRS.
+    """
+    images = _scan_outputs()
     return _ok({"images": images, "scan_dirs": OUTPUT_SCAN_DIRS})
 
 
-def _handle_debug_ip_paths(_: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_debug_ip_paths() -> Dict[str, Any]:
     """
-    Helper used while wiring up the Flux IP Adapter.
-
-    We try to inspect the LoadFluxIPAdapter node via /object_info so you can see
-    what file names Comfy is expecting, and we also do a best-effort scan of
-    /runpod-volume/models for matching safetensors.
+    Static debug helper for Flux IP-Adapter paths/fields.
+    This does NOT touch the filesystem or models, just returns
+    the expected field names you should use in workflows.
     """
-    info: Dict[str, Any] = {}
-    try:
-        resp = _comfy_get("/object_info")
-        obj = resp.json()
-        nodes = obj.get("nodes") or obj
-        lfip = nodes.get("LoadFluxIPAdapter", {})
-        required = (lfip.get("input") or {}).get("required", {})
-        clip_field: List[List[str]] = []
-        ipad_field: List[List[str]] = []
-        for field_name, meta in required.items():
-            default = meta.get("default")
-            if not isinstance(default, str):
-                continue
-            base = os.path.basename(default)
-            if "clip" in field_name or "vision" in field_name:
-                clip_field.append([field_name, base])
-            if "ip" in field_name or "adapter" in field_name:
-                ipad_field.append([field_name, base])
-        info["LoadFluxIPAdapter"] = {
-            "clip_vision_field": clip_field,
-            "ipadatper_field": ipad_field,
+    return _ok(
+        {
+            "LoadFluxIPAdapter": {
+                "clip_vision_field": [["model.safetensors", "sigclip_vision_patch14_384.safetensors"]],
+                "ipadatper_field": [["ip_adapter.safetensors"]],
+            }
         }
-    except Exception as e:  # noqa: BLE001
-        info["LoadFluxIPAdapter_error"] = str(e)
-
-    # Also scan the models tree so we can see what's actually present.
-    model_root = "/runpod-volume/models"
-    found: List[str] = []
-    if os.path.isdir(model_root):
-        for root, _dirs, files in os.walk(model_root):
-            for name in files:
-                if name.lower().endswith(".safetensors") and (
-                    "ip_adapter" in name.lower() or "clip" in name.lower()
-                ):
-                    found.append(os.path.join(root, name))
-
-    info["matching_safetensors"] = sorted(found)
-    info["model_root"] = model_root
-
-    return _ok(info)
+    )
 
 
 def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generic generate entrypoint.
+    Execute a ComfyUI workflow (Flux base or Flux+IP) and return
+    information about any new PNGs detected in the output dirs.
 
-    Expects:
-      {
-        "payload": {
-          "workflow": {
-            "client_id": "...",
-            "prompt": { ... full Comfy prompt graph ... }
-          }
-        }
-      }
+    Input contract (body.input.payload):
+      - workflow: dict representing the full ComfyUI prompt
+      - client_id: optional string (default: "imagineworlds")
+      - wait_seconds: optional float (default: 40)
+      - poll_interval: optional float (default: 4)
     """
-    _ensure_comfy_ready()
-
     payload = body.get("payload") or {}
-    workflow = payload.get("workflow") or payload.get("comfy_prompt")
+    workflow = payload.get("workflow")
+    client_id = payload.get("client_id", "imagineworlds")
+
     if not workflow:
-        return _fail("generate requires payload.workflow (Comfy prompt JSON)")
+        return _fail("generate requires payload.workflow")
 
-    if not isinstance(workflow, dict):
-        return _fail("payload.workflow must be an object")
-
-    before = _scan_outputs(OUTPUT_SCAN_DIRS)
+    wait_seconds = float(payload.get("wait_seconds") or 40.0)
+    poll_interval = float(payload.get("poll_interval") or 4.0)
 
     try:
-        resp = _comfy_post("/prompt", json=workflow)
-        prompt_resp = resp.json()
-        prompt_id = prompt_resp.get("prompt_id")
+        _ensure_comfy_ready()
     except Exception as e:  # noqa: BLE001
-        return _fail(f"failed to POST /prompt: {e}")
+        return _fail(f"generate preflight failed: {e}")
 
-    # Wait for new PNGs to appear
-    wait_seconds = int(payload.get("wait_seconds") or 40)
-    poll_interval = int(payload.get("poll_interval") or 4)
-    new_images, after = _await_new_outputs(
-        before,
+    # Record current outputs so we can diff after generation
+    before_images = _scan_outputs()
+    before_map = {img["path"]: img["mtime"] for img in before_images}
+
+    try:
+        req = {"client_id": client_id, "prompt": workflow}
+        logger.info("Submitting prompt to ComfyUI (client_id=%s)", client_id)
+        resp = _comfy_post("/prompt", json=req, timeout=COMFY_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        prompt_response = resp.json()
+        prompt_id = prompt_response.get("prompt_id")
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"generate failed: {e}")
+
+    # Wait for new PNGs to land in output dirs
+    new_images, after_map = _await_new_outputs(
+        before_map,
         wait_seconds=wait_seconds,
         poll_interval=poll_interval,
     )
 
-    latest_image = new_images[0] if new_images else None
+    latest_image: Optional[Dict[str, Any]] = None
+    if new_images:
+        latest_image = sorted(new_images, key=lambda x: x["mtime"])[-1]
+
+    wait_info = {
+        "before_count": len(before_map),
+        "after_count": len(after_map),
+        "output_scan_dirs": OUTPUT_SCAN_DIRS,
+        "wait_seconds": wait_seconds,
+        "poll_interval": poll_interval,
+    }
 
     return _ok(
         {
-            "prompt_response": prompt_resp,
             "prompt_id": prompt_id,
+            "prompt_response": prompt_response,
+            "wait_info": wait_info,
             "new_images": new_images,
             "latest_image": latest_image,
-            "wait_info": {
-                "before_count": len(before),
-                "after_count": len(after),
-                "output_scan_dirs": OUTPUT_SCAN_DIRS,
-                "wait_seconds": wait_seconds,
-                "poll_interval": poll_interval,
-            },
         }
     )
 
 
-# --------------------
-# RunPod handler entrypoint
-# --------------------
+# -------------------------------------------------------------------
+# RunPod entrypoint
+# -------------------------------------------------------------------
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     RunPod serverless handler.
 
-    Expects `event` to contain an `input` dict with at least an `action` key.
+    Expected event shape:
+      {
+        "input": {
+          "action": "...",
+          "payload": { ... }   # optional
+        }
+      }
     """
-    inp = event.get("input") or {}
-    action = inp.get("action") or "ping"
+    inp = (event or {}).get("input") or {}
+    action = inp.get("action")
+    payload = inp.get("payload")  # may be None
 
     logger.info("handler action=%s", action)
 
+    # Normalise body we pass to handlers
+    body = {"payload": payload} if isinstance(payload, dict) else {}
+
     try:
-        # Simple actions
         if action == "ping":
-            return _handle_ping(inp)
+            return _handle_ping()
         if action == "about":
-            return _handle_about(inp)
+            return _handle_about()
         if action == "preflight":
-            return _handle_preflight(inp)
+            return _handle_preflight()
         if action == "upload_input_url":
-            return _handle_upload_input_url(inp)
+            return _handle_upload_input_url(body)
         if action == "dump_comfy_log":
-            return _handle_dump_comfy_log(inp)
+            return _handle_dump_comfy_log(body)
         if action == "comfy_get":
-            return _handle_comfy_get(inp)
+            return _handle_comfy_get(body)
         if action == "history":
-            return _handle_history(inp)
+            return _handle_history(body)
         if action == "list_outputs":
-            return _handle_list_outputs(inp)
+            return _handle_list_outputs(body)
         if action == "list_all_outputs":
-            return _handle_list_all_outputs(inp)
+            return _handle_list_all_outputs()
         if action == "debug_ip_paths":
-            return _handle_debug_ip_paths(inp)
+            return _handle_debug_ip_paths()
+        if action == "generate":
+            # Generic generate (Flux base, Flux+IP, etc.)
+            return _handle_generate(body)
 
-        # Generation aliases – all funnel into the same implementation
-        if action in {
-            "generate",
-            "generate_flux",
-            "generate_flux_base",
-            "generate_flux_ip",
-        }:
-            return _handle_generate(inp)
-
-        return _fail(f"Unknown or missing action: {action!r}")
-
+        return _fail(f"unknown action: {action}")
     except Exception as e:  # noqa: BLE001
-        # Catch-all so we *always* return a JSON payload to RunPod.
-        logger.exception("Unhandled error in handler for action=%s", action)
-        return _fail(f"unhandled error: {e.__class__.__name__}: {e}")
+        logger.exception("Unhandled exception in handler")
+        return _fail(f"unhandled exception: {e}")
 
-
-# --------------------
-# RunPod serverless bootstrap
-# --------------------
 
 runpod.serverless.start({"handler": handler})
