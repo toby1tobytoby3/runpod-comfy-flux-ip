@@ -559,8 +559,13 @@ def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(workflow, dict) and "client_id" in workflow:
             workflow.pop("client_id")
 
-        req = {"client_id": client_id, "prompt": workflow}
-        logger.info("Submitting prompt to ComfyUI (client_id=%s)", client_id)
+        # Handle both workflow and prompt payloads gracefully
+        if "workflow" in payload:
+            req = {"client_id": client_id, "prompt": payload["workflow"]}
+        elif "prompt" in payload:
+            req = {"client_id": client_id, "prompt": payload["prompt"]}
+        else:
+            raise ValueError("Missing workflow or prompt in input payload")        logger.info("Submitting prompt to ComfyUI (client_id=%s)", client_id)
         resp = _comfy_post("/prompt", json=req, timeout=COMFY_REQUEST_TIMEOUT)
         resp.raise_for_status()
         prompt_response = resp.json()
