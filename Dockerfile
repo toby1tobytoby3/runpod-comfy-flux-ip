@@ -33,40 +33,33 @@ RUN mkdir -p /comfyui/models/xlabs && \
     ln -sf /runpod-volume/models/xlabs/ipadapters \
            /comfyui/models/xlabs/ipadapters || true
 
-# Safe optional patch for attn_mask only (no CLIP edits) – broader search
-# This aligns DoubleStreamBlock.forward with newer Flux / attention-mask usage,
-# without changing its internals – just accepting an extra kwarg with a default.
+# Flux attn_mask patch – custom node that strips legacy attn_mask kwarg
 RUN python - <<'PY'
-import os, re
+import pathlib, textwrap
 
-root = "/comfyui"
-patched = False
+patch_path = pathlib.Path("/comfyui/custom_nodes/flux_double_stream_patch.py")
+patch_path.parent.mkdir(parents=True, exist_ok=True)
+patch_path.write_text(textwrap.dedent("""
+    import logging
 
-for dirpath, dirnames, filenames in os.walk(root):
-    for fn in filenames:
-        if not fn.endswith(".py"):
-            continue
-        path = os.path.join(dirpath, fn)
-        try:
-            src = open(path, "r", encoding="utf-8").read()
-        except Exception:
-            continue
-        # Look for the DoubleStreamBlock class and ensure its forward can accept attn_mask
-        if "class DoubleStreamBlock" in src and "attn_mask=None" not in src:
-            new_src, n = re.subn(
-                r"def forward\\(self,[^)]*\\):",
-                lambda m: m.group(0)[:-2] + ", attn_mask=None):",
-                src,
-                count=1,
-            )
-            if n:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(new_src)
-                print("Patched DoubleStreamBlock in", path)
-                patched = True
+    log = logging.getLogger(__name__)
 
-if not patched:
-    print("No DoubleStreamBlock patch applied (maybe already patched).")
+    try:
+        from comfy.ldm.flux.model import DoubleStreamBlock
+    except Exception as e:
+        log.warning("flux_double_stream_patch: could not import DoubleStreamBlock: %s", e)
+    else:
+        _orig_forward = DoubleStreamBlock.forward
+
+        def _patched_forward(self, *args, **kwargs):
+            # Drop legacy/extra attention mask kwarg if present
+            kwargs.pop("attn_mask", None)
+            return _orig_forward(self, *args, **kwargs)
+
+        DoubleStreamBlock.forward = _patched_forward
+        log.info("flux_double_stream_patch: DoubleStreamBlock.forward patched to ignore attn_mask kwarg")
+"""))
+print("Wrote flux_double_stream_patch custom node to", patch_path)
 PY
 
 # Final setup – unchanged
