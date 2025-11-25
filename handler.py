@@ -240,17 +240,13 @@ def _handle_list_all_outputs():
 
 
 def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Simplified, stable generate handler — forwards workflow directly to ComfyUI."""
     payload = body.get("payload") or {}
-    client_id = payload.get("client_id", "imagineworlds")
-
-    # Detect and extract workflow (handle both keys safely)
     workflow = payload.get("workflow") or payload.get("prompt")
     if not workflow:
         return _fail("generate requires payload.workflow or payload.prompt")
 
-    wait_seconds = float(payload.get("wait_seconds") or 40.0)
-    poll_interval = float(payload.get("poll_interval") or 4.0)
-
+    # Ensure Comfy is alive
     try:
         _ensure_comfy_ready()
     except Exception as e:
@@ -258,30 +254,32 @@ def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
 
     before_images = _scan_outputs()
     before_map = {img["path"]: img["mtime"] for img in before_images}
+    wait_seconds = float(payload.get("wait_seconds") or 40.0)
+    poll_interval = float(payload.get("poll_interval") or 4.0)
 
     try:
-        if isinstance(workflow, dict):
-            workflow.pop("client_id", None)
-            workflow.pop("prompt", None)  # prevent double wrapping
-
-        req = {"client_id": client_id, "prompt": workflow}
-        logger.info("Submitting prompt to ComfyUI (client_id=%s)", client_id)
-        resp = _comfy_post("/prompt", json=req, timeout=COMFY_REQUEST_TIMEOUT)
+        # Post the workflow exactly as-is — do NOT re-wrap or pop anything
+        resp = _comfy_post("/prompt", json=workflow, timeout=COMFY_REQUEST_TIMEOUT)
         resp.raise_for_status()
         prompt_response = resp.json()
         prompt_id = prompt_response.get("prompt_id")
     except Exception as e:
         return _fail(f"generate failed: {e}")
 
+    # Wait for new outputs
     new_images, after_map = _await_new_outputs(before_map, wait_seconds, poll_interval)
     latest_image = sorted(new_images, key=lambda x: x["mtime"])[-1] if new_images else None
 
     return _ok({
         "prompt_id": prompt_id,
         "prompt_response": prompt_response,
-        "wait_info": {"before_count": len(before_map), "after_count": len(after_map),
-                      "output_scan_dirs": OUTPUT_SCAN_DIRS,
-                      "wait_seconds": wait_seconds, "poll_interval": poll_interval},
+        "wait_info": {
+            "before_count": len(before_map),
+            "after_count": len(after_map),
+            "output_scan_dirs": OUTPUT_SCAN_DIRS,
+            "wait_seconds": wait_seconds,
+            "poll_interval": poll_interval,
+        },
         "new_images": new_images,
         "latest_image": latest_image,
     })
