@@ -556,6 +556,9 @@ def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
     before_map = {img["path"]: img["mtime"] for img in before_images}
 
     try:
+        if isinstance(workflow, dict) and "client_id" in workflow:
+            workflow.pop("client_id")
+
         req = {"client_id": client_id, "prompt": workflow}
         logger.info("Submitting prompt to ComfyUI (client_id=%s)", client_id)
         resp = _comfy_post("/prompt", json=req, timeout=COMFY_REQUEST_TIMEOUT)
