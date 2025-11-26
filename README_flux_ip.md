@@ -118,6 +118,15 @@ inside the ComfyUI runtime regardless of import timing, so Flux generations are
 consistently saved. Older variants that relied on a deferred hook alone could
 miss the first import and lead to intermittent failures.
 
+### Extra guard via `sitecustomize.py`
+
+We also ship a small `sitecustomize.py` that is copied into the virtual
+environment (`/opt/venv/lib/python3.12/site-packages/sitecustomize.py`). Python
+imports this automatically on interpreter startup, so it pre-pends the custom
+node directory to `sys.path` and eagerly imports `flux_double_stream_patch`. If
+ComfyUI ever starts before loading custom nodes, this guarantees the patch is
+still active in the process that actually runs Flux.
+
 ## Summary
 
 - `comfy/pod_ip_prompt.json` = golden Flux+IP workflow template

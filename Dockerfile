@@ -38,6 +38,9 @@ RUN mkdir -p /comfyui/models/ipadapters && \
 # ---------------------------------------------------------------------
 COPY flux_double_stream_patch.py /comfyui/custom_nodes/flux_double_stream_patch.py
 
+# Ensure the patch loads in every Python process (ComfyUI runtime + workers)
+COPY sitecustomize.py /opt/venv/lib/python3.12/site-packages/sitecustomize.py
+
 # ---------------------------------------------------------------------
 # Python deps
 # ---------------------------------------------------------------------
