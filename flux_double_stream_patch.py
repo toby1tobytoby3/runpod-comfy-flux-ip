@@ -1,14 +1,14 @@
-"""Ensure Flux DoubleStreamBlock.forward ignores unexpected attn_mask args.
-
-ComfyUI's Flux models can receive an ``attn_mask`` keyword that older Flux
-weights don't accept. This script applies a defensive patch even if
-``comfy.ldm.flux.model`` was imported before the custom node is loaded, while
-also registering an import hook as a fallback.
 """
-import importlib
+Minimal, robust patch for Flux DoubleStreamBlock.forward attn_mask mismatch.
+
+This runs as a ComfyUI custom node module. On import, it:
+
+- Imports comfy.ldm.flux.model (which defines Flux + DoubleStreamBlock)
+- Wraps DoubleStreamBlock.forward so it *ignores* any unexpected `attn_mask`
+  keyword, avoiding TypeError when newer Flux call sites pass that argument.
+"""
+
 import logging
-import sys
-from types import ModuleType
 
 log = logging.getLogger("flux_double_stream_patch")
 if not logging.getLogger().handlers:
@@ -17,65 +17,45 @@ log.setLevel(logging.INFO)
 
 PATCH_FLAG = "_flux_attn_mask_patched"
 
-def _patch_forward(module: ModuleType, *, reason: str) -> bool:
-    """Patch DoubleStreamBlock.forward to drop attn_mask if present."""
+
+def _apply_patch() -> bool:
     try:
-        DoubleStreamBlock = module.DoubleStreamBlock
+        # This will use the comfy copy of Flux.
+        import comfy.ldm.flux.model as flux_model  # type: ignore
+
+        DoubleStreamBlock = flux_model.DoubleStreamBlock
         original_forward = DoubleStreamBlock.forward
-        if getattr(original_forward, PATCH_FLAG, False):
-            log.info("flux_double_stream_patch: forward already patched (%s)", reason)
-            return True
-
-        def patched_forward(self, *args, **kwargs):
-            kwargs.pop("attn_mask", None)
-            return original_forward(self, *args, **kwargs)
-
-        setattr(patched_forward, PATCH_FLAG, True)
-        DoubleStreamBlock.forward = patched_forward
-        log.info(
-            "✅ flux_double_stream_patch: DoubleStreamBlock.forward patched successfully (%s)",
-            reason,
+    except Exception as exc:
+        log.warning(
+            "⚠️ flux_double_stream_patch: could not import Flux DoubleStreamBlock: %s",
+            exc,
         )
-        return True
-    except Exception as exc:  # pragma: no cover - defensive logging only
-        log.warning("⚠️ flux_double_stream_patch: could not apply patch (%s): %s", reason, exc)
         return False
 
-def _ensure_patch_applied() -> bool:
-    # If the module is already loaded, patch immediately.
-    module = sys.modules.get("comfy.ldm.flux.model")
-    if isinstance(module, ModuleType):
-        return _patch_forward(module, reason="module already imported")
+    # Avoid double-wrapping if Comfy reloads the node.
+    if getattr(original_forward, PATCH_FLAG, False):
+        log.info(
+            "flux_double_stream_patch: DoubleStreamBlock.forward already patched, skipping"
+        )
+        return True
 
-    class _FluxImportHook:
-        def find_spec(self, fullname, path, target=None):
-            if fullname != "comfy.ldm.flux.model":
-                return None
-            spec = importlib.util.find_spec(fullname)
-            if spec is None or spec.loader is None:
-                return None
-            original_loader = spec.loader
+    def patched_forward(self, *args, **kwargs):
+        # Drop stray attn_mask kwarg if present.
+        if "attn_mask" in kwargs:
+            kwargs.pop("attn_mask", None)
+        return original_forward(self, *args, **kwargs)
 
-            class LoaderWrapper(original_loader.__class__):
-                def exec_module(self, module):
-                    original_loader.exec_module(module)
-                    _patch_forward(module, reason="import hook")
+    setattr(patched_forward, PATCH_FLAG, True)
+    DoubleStreamBlock.forward = patched_forward
+    log.info(
+        "✅ flux_double_stream_patch: DoubleStreamBlock.forward patched via direct import"
+    )
+    return True
 
-            spec.loader = LoaderWrapper()
-            return spec
 
-    # Avoid inserting duplicate hooks when the node reloads.
-    if not any(isinstance(hook, _FluxImportHook) for hook in sys.meta_path):
-        sys.meta_path.insert(0, _FluxImportHook())
-        log.info("flux_double_stream_patch: registered import hook for comfy.ldm.flux.model")
-    return False
+# Run the patch as soon as this module is imported by ComfyUI.
+_apply_patch()
 
+# No actual nodes are added; this file exists purely for its side-effect.
 NODE_CLASS_MAPPINGS = {}
 NODES_LIST = []
-
-# Apply the patch whenever this module is imported (custom-node path)
-_ensure_patch_applied()
-
-if __name__ == "__main__":
-    # If executed directly (e.g. container bootstrap), run the same logic.
-    _ensure_patch_applied()
