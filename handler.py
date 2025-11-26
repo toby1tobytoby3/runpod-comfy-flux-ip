@@ -11,6 +11,8 @@ COMFY_DIR = os.getenv("COMFY_DIR", "/comfyui")
 COMFY_PYTHON = os.getenv("COMFY_PYTHON", "/opt/venv/bin/python")
 COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
 COMFY_REQUEST_TIMEOUT = float(os.getenv("COMFY_REQUEST_TIMEOUT", "60.0"))
+COMFY_OUTPUT_WAIT_SECONDS = float(os.getenv("COMFY_OUTPUT_WAIT_SECONDS", "300"))
+COMFY_OUTPUT_POLL_INTERVAL = float(os.getenv("COMFY_OUTPUT_POLL_INTERVAL", "5.0"))
 
 INPUT_DIR = os.getenv("INPUT_DIR", "/runpod-volume/ComfyUI/input")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/runpod-volume/ComfyUI/output")
@@ -135,7 +137,11 @@ def _scan_outputs():
     return imgs
 
 
-def _await_new_outputs(before, wait_seconds: float = 60.0, poll_interval: float = 4.0):
+def _await_new_outputs(
+    before,
+    wait_seconds: float = COMFY_OUTPUT_WAIT_SECONDS,
+    poll_interval: float = COMFY_OUTPUT_POLL_INTERVAL,
+):
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         imgs = _scan_outputs()
