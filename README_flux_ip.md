@@ -88,6 +88,36 @@ It:
 
 Without this patch, Flux+IP workflows may crash with the `attn_mask` TypeError.
 
+### Why some runs save images and others do not
+
+ComfyUI launches a separate Python process for the UI/runtime. When that
+process imports `comfy.ldm.flux.model` **before** our patch module is on
+`sys.meta_path`, the `DoubleStreamBlock` remains unpatched and Flux fails with
+`attn_mask` during sampling. That failure happens inside the diffusion loop, so
+the workflow finishes without saving anything. When the patch loads **before**
+the first Flux import, the `attn_mask` argument is dropped and the run
+completes, producing images.
+
+To make the patch consistent across processes and import orders we now ship
+`flux_double_stream_patch.py` as a Comfy custom node that executes its patch
+logic on import. When ComfyUI loads custom nodes, the module:
+
+1. Patches `DoubleStreamBlock.forward` immediately if `comfy.ldm.flux.model`
+   was already imported.
+2. Otherwise registers an import hook that applies the patch the first time the
+   module is loaded.
+
+Because the patch runs inside the actual ComfyUI process, the `attn_mask` bug
+is avoided regardless of startup sequence, and Flux generations save
+consistently.
+
+### Which patch variant to keep
+
+Use the import-on-load custom-node version. It guarantees the patch is applied
+inside the ComfyUI runtime regardless of import timing, so Flux generations are
+consistently saved. Older variants that relied on a deferred hook alone could
+miss the first import and lead to intermittent failures.
+
 ## Summary
 
 - `comfy/pod_ip_prompt.json` = golden Flux+IP workflow template

@@ -34,7 +34,7 @@ RUN mkdir -p /comfyui/models/ipadapters && \
     ln -sf /runpod-volume/models/xlabs/ipadapters /comfyui/models/xlabs/ipadapters || true
 
 # ---------------------------------------------------------------------
-# Flux DoubleStreamBlock patch — resilient import version
+# Flux DoubleStreamBlock patch — import-time application
 # ---------------------------------------------------------------------
 COPY flux_double_stream_patch.py /comfyui/custom_nodes/flux_double_stream_patch.py
 
@@ -46,5 +46,5 @@ RUN pip install --no-cache-dir runpod requests
 # ---------------------------------------------------------------------
 # Bootstrap & Launch
 # ---------------------------------------------------------------------
-# Run the patch bootstrap BEFORE handler starts ComfyUI.
-CMD ["bash", "-c", "python3 /comfyui/custom_nodes/flux_double_stream_patch.py && python3 /workspace/handler.py"]
+# Start the RunPod handler; ComfyUI is spawned from there and imports the patch as a custom node.
+CMD ["python3", "/workspace/handler.py"]

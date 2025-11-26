@@ -15,9 +15,7 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO)
 log.setLevel(logging.INFO)
 
-
 PATCH_FLAG = "_flux_attn_mask_patched"
-
 
 def _patch_forward(module: ModuleType, *, reason: str) -> bool:
     """Patch DoubleStreamBlock.forward to drop attn_mask if present."""
@@ -42,7 +40,6 @@ def _patch_forward(module: ModuleType, *, reason: str) -> bool:
     except Exception as exc:  # pragma: no cover - defensive logging only
         log.warning("⚠️ flux_double_stream_patch: could not apply patch (%s): %s", reason, exc)
         return False
-
 
 def _ensure_patch_applied() -> bool:
     # If the module is already loaded, patch immediately.
@@ -73,10 +70,12 @@ def _ensure_patch_applied() -> bool:
         log.info("flux_double_stream_patch: registered import hook for comfy.ldm.flux.model")
     return False
 
-
 NODE_CLASS_MAPPINGS = {}
 NODES_LIST = []
 
+# Apply the patch whenever this module is imported (custom-node path)
+_ensure_patch_applied()
 
 if __name__ == "__main__":
+    # If executed directly (e.g. container bootstrap), run the same logic.
     _ensure_patch_applied()
