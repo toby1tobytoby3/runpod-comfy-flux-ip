@@ -34,9 +34,6 @@ RUN mkdir -p /comfyui/models/ipadapters && \
     ln -sf /runpod-volume/models/xlabs/ipadapters /comfyui/models/xlabs/ipadapters || true
 
 # ---------------------------------------------------------------------
-# Flux DoubleStreamBlock patch — now as a valid custom node
-# ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
 # Flux DoubleStreamBlock patch — deferred import-safe version
 # ---------------------------------------------------------------------
 RUN python - <<'PY'
@@ -51,12 +48,10 @@ p.write_text(textwrap.dedent("""
         try:
             import comfy.ldm.flux.model as flux_model
             from comfy.ldm.flux.model import DoubleStreamBlock
-
             original_forward = DoubleStreamBlock.forward
             def patched_forward(self, *args, **kwargs):
                 kwargs.pop("attn_mask", None)
                 return original_forward(self, *args, **kwargs)
-
             DoubleStreamBlock.forward = patched_forward
             log.info("✅ flux_double_stream_patch: DoubleStreamBlock.forward patched successfully (deferred)")
         except Exception as e:
@@ -95,6 +90,7 @@ PY
 RUN pip install --no-cache-dir runpod requests
 
 # ---------------------------------------------------------------------
-# Launch
+# Bootstrap & Launch
 # ---------------------------------------------------------------------
-CMD ["python3", "/workspace/handler.py"]
+# Run the patch bootstrap BEFORE handler starts ComfyUI.
+CMD ["bash", "-c", "python3 /comfyui/custom_nodes/flux_double_stream_patch.py && python3 /workspace/handler.py"]
