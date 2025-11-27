@@ -11,7 +11,11 @@ This runs as a ComfyUI custom node module. On import, it:
   coming from x-flux-comfyui or other custom loaders).
 """
 
+import importlib
+import importlib.abc
+import importlib.machinery
 import logging
+import os
 import sys
 
 log = logging.getLogger("flux_double_stream_patch")
@@ -106,8 +110,63 @@ def _apply_patch_all() -> int:
     return patched
 
 
+class _FluxImportHook(importlib.abc.MetaPathFinder):
+    """Meta path finder that patches Flux modules as they are imported.
+
+    Some custom nodes reload or vend their own copies of ``flux.model``.
+    Installing this hook guarantees we re-apply the ``attn_mask`` patch to
+    every new ``DoubleStreamBlock`` definition as soon as it is loaded.
+    """
+
+    def find_spec(self, fullname, path, target=None):  # noqa: D401
+        if "flux.model" not in fullname:
+            return None
+
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if not spec or not spec.loader or not hasattr(spec.loader, "exec_module"):
+            return spec
+
+        orig_exec_module = spec.loader.exec_module
+
+        def _exec_and_patch(module):
+            orig_exec_module(module)
+            try:
+                _patch_module(module)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "⚠️ flux_double_stream_patch: import hook could not patch %s: %s",
+                    fullname,
+                    exc,
+                )
+
+        spec.loader.exec_module = _exec_and_patch
+        return spec
+
+
+def _install_import_hook():
+    if any(isinstance(f, _FluxImportHook) for f in sys.meta_path):
+        return False
+    sys.meta_path.insert(0, _FluxImportHook())
+    log.info("flux_double_stream_patch: import hook installed")
+    return True
+
+
+# Optional debug helper to enumerate loaded Flux modules for quicker triage.
+def _log_loaded_flux_modules():
+    log.info("flux_double_stream_patch: listing loaded flux modules...")
+    for name in sorted(sys.modules.keys()):
+        if "flux.model" in name:
+            log.info("  - %s", name)
+
+
 # Run the patch as soon as this module is imported by ComfyUI.
 _apply_patch_all()
+# And keep patching future imports/reloads of any flux.model variants.
+_install_import_hook()
+# If requested, emit the currently loaded flux modules to the log to help
+# pinpoint which names the import hook should target.
+if os.getenv("FLUX_PATCH_LOG_MODULES"):
+    _log_loaded_flux_modules()
 
 # No actual nodes are added; this file exists purely for its side-effect.
 NODE_CLASS_MAPPINGS = {}
