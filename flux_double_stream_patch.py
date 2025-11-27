@@ -11,7 +11,7 @@ that older checkpoints do not accept. This custom node:
   ``flux.model`` imports.
 - Emits a one-time log of the kwargs received to speed up triage if new keys
   start appearing.
-"""
+""" 
 
 import importlib
 import importlib.abc
