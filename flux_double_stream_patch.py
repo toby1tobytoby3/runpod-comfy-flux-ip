@@ -1,214 +1,155 @@
-"""Ensure ``DoubleStreamBlock.forward`` tolerates new kwargs from newer Flux call-sites.
-
-ComfyUI Flux variants sometimes call ``DoubleStreamBlock.forward`` with extra
-keyword arguments (``attn_mask`` / ``attention_mask`` / ``transformer_options``)
-that older checkpoints do not accept. This custom node:
-
-- Patches every loaded ``DoubleStreamBlock`` (``comfy.ldm.flux.model`` and any
-  vendored "flux.model" modules) so unexpected kwargs are *dropped* instead of
-  raising ``TypeError``.
-- Installs a meta-path import hook to reapply the patch to any future
-  ``flux.model`` imports.
-- Emits a one-time log of the kwargs received to speed up triage if new keys
-  start appearing.
-""" 
-
-import importlib
-import importlib.abc
-import importlib.machinery
+import builtins
 import inspect
 import logging
-import os
 import sys
+from types import ModuleType
 
-log = logging.getLogger("flux_double_stream_patch")
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
-log.setLevel(logging.INFO)
+log = logging.getLogger(__name__)
 
-PATCH_FLAG = "_flux_attn_mask_patched"
-LOGGED_ONCE = False
+_PATCH_SENTINEL = "_flux_double_stream_patch_applied"
 
 
-def _patch_module(mod) -> bool:
+def _patch_module(module: ModuleType) -> bool:
     """
-    Given a module object, try to patch its DoubleStreamBlock.forward.
-    Returns True if a new patch was applied, False otherwise.
-    """
-    name = getattr(mod, "__name__", str(mod))
+    Find a DoubleStreamBlock in the given module and patch its .forward
+    so that it safely ignores extra kwargs like attn_mask / transformer_options.
 
-    try:
-        DoubleStreamBlock = mod.DoubleStreamBlock
-        original_forward = DoubleStreamBlock.forward
-    except Exception as exc:  # noqa: BLE001
-        # Not a flux model module, or missing DoubleStreamBlock.
-        log.debug(
-            "flux_double_stream_patch: %s has no DoubleStreamBlock (%s)",
-            name,
-            exc,
-        )
+    Returns True if we patched anything, False otherwise.
+    """
+    if module is None:
         return False
 
-    # Avoid double-wrapping if Comfy reloads the node or module.
-    if getattr(original_forward, PATCH_FLAG, False):
+    try:
+        dct = getattr(module, "__dict__", None)
+        if not isinstance(dct, dict):
+            return False
+
+        DoubleStreamBlock = dct.get("DoubleStreamBlock")
+        if not isinstance(DoubleStreamBlock, type):
+            return False
+
+        forward = getattr(DoubleStreamBlock, "forward", None)
+        if not callable(forward):
+            return False
+
+        # If we've already wrapped this forward, do nothing.
+        if getattr(forward, _PATCH_SENTINEL, False):
+            # Only log at DEBUG so we don't spam.
+            log.debug(
+                "flux_double_stream_patch: %s.DoubleStreamBlock.forward already patched, skipping",
+                getattr(module, "__name__", repr(module)),
+            )
+            return False
+
+        # Introspect original signature so we don't pass unexpected kwargs.
+        try:
+            sig = inspect.signature(forward)
+            params = sig.parameters
+            allow_all_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            allowed_kw = {
+                name
+                for name, p in params.items()
+                if name != "self"
+                and p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            }
+        except Exception as e:  # pragma: no cover
+            log.warning(
+                "flux_double_stream_patch: could not inspect signature for %r: %s",
+                module,
+                e,
+            )
+            sig = None
+            allow_all_kwargs = True
+            allowed_kw = set()
+
+        original_forward = forward
+
+        def patched_forward(self, *args, **kwargs):
+            # This can be noisy, keep at DEBUG.
+            log.debug(
+                "flux_double_stream_patch: DoubleStreamBlock.forward called with kwargs=%s (args_len=%d)",
+                list(kwargs.keys()),
+                len(args),
+            )
+
+            # Comfy / x-flux now sometimes pass these, but older DoubleStreamBlock
+            # implementations don't know about them. We just drop them.
+            kwargs.pop("attn_mask", None)
+            kwargs.pop("attention_mask", None)
+            kwargs.pop("transformer_options", None)
+
+            # If the original forward didn't accept arbitrary **kwargs,
+            # filter out anything that isn't in the original signature.
+            if sig is not None and not allow_all_kwargs:
+                filtered = {k: v for k, v in kwargs.items() if k in allowed_kw}
+            else:
+                filtered = kwargs
+
+            return original_forward(self, *args, **filtered)
+
+        # Mark so we can detect and avoid double-wrapping later.
+        setattr(patched_forward, _PATCH_SENTINEL, True)
+
+        DoubleStreamBlock.forward = patched_forward
+
         log.info(
-            "flux_double_stream_patch: %s.DoubleStreamBlock.forward already patched, skipping",
-            name,
+            "✅ flux_double_stream_patch: patched DoubleStreamBlock.forward in %s",
+            getattr(module, "__name__", repr(module)),
+        )
+        return True
+
+    except Exception as e:  # pragma: no cover
+        log.exception(
+            "flux_double_stream_patch: unexpected error while patching %r: %s", module, e
         )
         return False
 
-    sig = inspect.signature(original_forward)
-    has_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
-    allowed_kwargs = {
-        name
-        for name, param in sig.parameters.items()
-        if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
-    }
 
-    def patched_forward(self, *args, **kwargs):
-        # Log once so we know which kwargs are hitting the patched forward
-        global LOGGED_ONCE
-        if not LOGGED_ONCE:
-            try:
-                log.warning(
-                    "flux_double_stream_patch: DoubleStreamBlock.forward called with kwargs=%s (args_len=%d)",
-                    list(kwargs.keys()),
-                    len(args),
-                )
-            except Exception:
-                pass
-            LOGGED_ONCE = True
-
-        # Drop stray kwargs that the original forward does not accept to avoid TypeErrors
-        if not has_var_kw:
-            for key in list(kwargs.keys()):
-                if key not in allowed_kwargs:
-                    kwargs.pop(key, None)
-        else:
-            # Even if **kwargs is accepted, remove the known problematic extras
-            for bad_key in ("attn_mask", "attention_mask", "transformer_options"):
-                if bad_key in kwargs:
-                    log.warning(
-                        "flux_double_stream_patch: dropping unsupported kwarg %r from DoubleStreamBlock.forward",
-                        bad_key,
-                    )
-                    kwargs.pop(bad_key, None)
-        # Also ensure these keys are stripped if present in the expected set
-        for bad_key in ("attn_mask", "attention_mask"):
-            if bad_key in kwargs:
-                kwargs.pop(bad_key, None)
-
-        return original_forward(self, *args, **kwargs)
-
-    setattr(patched_forward, PATCH_FLAG, True)
-    DoubleStreamBlock.forward = patched_forward
-
-    log.info(
-        "✅ flux_double_stream_patch: patched DoubleStreamBlock.forward in %s",
-        name,
-    )
-    return True
-
-
-def _apply_patch_all() -> int:
+def _patch_all_loaded_modules() -> int:
     """
-    Patch the canonical comfy.ldm.flux.model *and* any additional
-    Flux model modules that are already loaded into sys.modules.
-
-    Returns the number of modules we actually patched.
+    Scan sys.modules and patch any module that defines DoubleStreamBlock.
+    This is cheap and robust; we also guard against double-wrapping.
     """
-    patched = 0
-
-    # 1) Patch the canonical comfy module first (base Flux).
-    try:
-        import comfy.ldm.flux.model as flux_model  # type: ignore[attr-defined]
-
-        if _patch_module(flux_model):
-            patched += 1
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "⚠️ flux_double_stream_patch: could not import comfy.ldm.flux.model: %s",
-            exc,
+    count = 0
+    for module in list(sys.modules.values()):
+        try:
+            if _patch_module(module):
+                count += 1
+        except Exception:  # pragma: no cover
+            log.exception(
+                "flux_double_stream_patch: error while scanning module %r", module
+            )
+    if count:
+        log.info(
+            "flux_double_stream_patch: total DoubleStreamBlock-containing modules patched in scan: %d",
+            count,
         )
-
-    # 2) Patch any *additional* flux.model modules already loaded.
-    #    Some custom nodes may import Flux under different module names
-    #    but from the same or a vendored file.
-    for name, mod in list(sys.modules.items()):
-        if not isinstance(name, str):
-            continue
-        if "flux.model" not in name:
-            continue
-        if mod is None:
-            continue
-        if not hasattr(mod, "DoubleStreamBlock"):
-            continue
-
-        if _patch_module(mod):
-            patched += 1
-
-    log.info("flux_double_stream_patch: total modules patched: %d", patched)
-    return patched
+    return count
 
 
-class _FluxImportHook(importlib.abc.MetaPathFinder):
-    """Meta path finder that patches Flux modules as they are imported.
-
-    Some custom nodes reload or vend their own copies of ``flux.model``.
-    Installing this hook guarantees we re-apply the ``attn_mask`` patch to
-    every new ``DoubleStreamBlock`` definition as soon as it is loaded.
-    """
-
-    def find_spec(self, fullname, path, target=None):  # noqa: D401
-        if "flux.model" not in fullname:
-            return None
-
-        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
-        if not spec or not spec.loader or not hasattr(spec.loader, "exec_module"):
-            return spec
-
-        orig_exec_module = spec.loader.exec_module
-
-        def _exec_and_patch(module):
-            orig_exec_module(module)
-            try:
-                _patch_module(module)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "⚠️ flux_double_stream_patch: import hook could not patch %s: %s",
-                    fullname,
-                    exc,
-                )
-
-        spec.loader.exec_module = _exec_and_patch
-        return spec
+# Initial scan: catches any flux modules that were imported before this custom node.
+_patch_all_loaded_modules()
 
 
-def _install_import_hook():
-    if any(isinstance(f, _FluxImportHook) for f in sys.meta_path):
-        return False
-    sys.meta_path.insert(0, _FluxImportHook())
-    log.info("flux_double_stream_patch: import hook installed")
-    return True
+# Global import hook: after every import, rescan sys.modules and patch any new
+# DoubleStreamBlock definitions. We do this in the simplest, safest way by
+# wrapping builtins.__import__ and re-running the scan. Double-patching is
+# avoided via the sentinel on the wrapped forward.
+if not getattr(builtins, "_flux_double_stream_import_hook_installed", False):
+    _original_import = builtins.__import__
 
+    def _patched_import(name, globals=None, locals=None, fromlist=(), level=0):
+        module = _original_import(name, globals, locals, fromlist, level)
+        # After any import completes, patch any new DoubleStreamBlock classes.
+        _patch_all_loaded_modules()
+        return module
 
-# Optional debug helper to enumerate loaded Flux modules for quicker triage.
-def _log_loaded_flux_modules():
-    log.info("flux_double_stream_patch: listing loaded flux modules...")
-    for name in sorted(sys.modules.keys()):
-        if "flux.model" in name:
-            log.info("  - %s", name)
-
-
-# Run the patch as soon as this module is imported by ComfyUI.
-_apply_patch_all()
-# And keep patching future imports/reloads of any flux.model variants.
-_install_import_hook()
-# If requested, emit the currently loaded flux modules to the log to help
-# pinpoint which names the import hook should target.
-if os.getenv("FLUX_PATCH_LOG_MODULES"):
-    _log_loaded_flux_modules()
-
-# No actual nodes are added; this file exists purely for its side-effect.
-NODE_CLASS_MAPPINGS = {}
-NODES_LIST = []
+    builtins.__import__ = _patched_import
+    builtins._flux_double_stream_import_hook_installed = True
+    log.info("flux_double_stream_patch: global import hook installed")
