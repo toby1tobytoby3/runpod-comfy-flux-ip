@@ -6,9 +6,13 @@ This runs as a ComfyUI custom node module. On import, it:
 - Imports comfy.ldm.flux.model (which defines Flux + DoubleStreamBlock)
 - Wraps DoubleStreamBlock.forward so it *ignores* any unexpected `attn_mask`
   keyword, avoiding TypeError when newer Flux call sites pass that argument.
+- Additionally scans all loaded modules whose name contains "flux.model"
+  and patches any extra DoubleStreamBlock definitions (e.g. variants
+  coming from x-flux-comfyui or other custom loaders).
 """
 
 import logging
+import sys
 
 log = logging.getLogger("flux_double_stream_patch")
 if not logging.getLogger().handlers:
@@ -18,26 +22,32 @@ log.setLevel(logging.INFO)
 PATCH_FLAG = "_flux_attn_mask_patched"
 
 
-def _apply_patch() -> bool:
-    try:
-        # This will use the comfy copy of Flux.
-        import comfy.ldm.flux.model as flux_model  # type: ignore
+def _patch_module(mod) -> bool:
+    """
+    Given a module object, try to patch its DoubleStreamBlock.forward.
+    Returns True if a new patch was applied, False otherwise.
+    """
+    name = getattr(mod, "__name__", str(mod))
 
-        DoubleStreamBlock = flux_model.DoubleStreamBlock
+    try:
+        DoubleStreamBlock = mod.DoubleStreamBlock
         original_forward = DoubleStreamBlock.forward
-    except Exception as exc:
-        log.warning(
-            "⚠️ flux_double_stream_patch: could not import Flux DoubleStreamBlock: %s",
+    except Exception as exc:  # noqa: BLE001
+        # Not a flux model module, or missing DoubleStreamBlock.
+        log.debug(
+            "flux_double_stream_patch: %s has no DoubleStreamBlock (%s)",
+            name,
             exc,
         )
         return False
 
-    # Avoid double-wrapping if Comfy reloads the node.
+    # Avoid double-wrapping if Comfy reloads the node or module.
     if getattr(original_forward, PATCH_FLAG, False):
         log.info(
-            "flux_double_stream_patch: DoubleStreamBlock.forward already patched, skipping"
+            "flux_double_stream_patch: %s.DoubleStreamBlock.forward already patched, skipping",
+            name,
         )
-        return True
+        return False
 
     def patched_forward(self, *args, **kwargs):
         # Drop stray attn_mask kwarg if present.
@@ -47,14 +57,57 @@ def _apply_patch() -> bool:
 
     setattr(patched_forward, PATCH_FLAG, True)
     DoubleStreamBlock.forward = patched_forward
+
     log.info(
-        "✅ flux_double_stream_patch: DoubleStreamBlock.forward patched via direct import"
+        "✅ flux_double_stream_patch: patched DoubleStreamBlock.forward in %s",
+        name,
     )
     return True
 
 
+def _apply_patch_all() -> int:
+    """
+    Patch the canonical comfy.ldm.flux.model *and* any additional
+    Flux model modules that are already loaded into sys.modules.
+
+    Returns the number of modules we actually patched.
+    """
+    patched = 0
+
+    # 1) Patch the canonical comfy module first (base Flux).
+    try:
+        import comfy.ldm.flux.model as flux_model  # type: ignore[attr-defined]
+
+        if _patch_module(flux_model):
+            patched += 1
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "⚠️ flux_double_stream_patch: could not import comfy.ldm.flux.model: %s",
+            exc,
+        )
+
+    # 2) Patch any *additional* flux.model modules already loaded.
+    #    Some custom nodes may import Flux under different module names
+    #    but from the same or a vendored file.
+    for name, mod in list(sys.modules.items()):
+        if not isinstance(name, str):
+            continue
+        if "flux.model" not in name:
+            continue
+        if mod is None:
+            continue
+        if not hasattr(mod, "DoubleStreamBlock"):
+            continue
+
+        if _patch_module(mod):
+            patched += 1
+
+    log.info("flux_double_stream_patch: total modules patched: %d", patched)
+    return patched
+
+
 # Run the patch as soon as this module is imported by ComfyUI.
-_apply_patch()
+_apply_patch_all()
 
 # No actual nodes are added; this file exists purely for its side-effect.
 NODE_CLASS_MAPPINGS = {}
