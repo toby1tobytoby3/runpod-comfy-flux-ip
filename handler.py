@@ -1,4 +1,4 @@
-import json, logging, os, pathlib, time, subprocess, requests, runpod
+import importlib.util, json, logging, os, pathlib, time, subprocess, requests, runpod
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------
@@ -194,11 +194,33 @@ def _handle_preflight():
     patch_error = "flux_double_stream_patch: could not apply patch" in tail
     import_failed = "IMPORT FAILED" in tail and "flux_double_stream_patch.py" in tail
 
+    patch_file = pathlib.Path("/comfyui/custom_nodes/flux_double_stream_patch.py")
+    patch_spec = importlib.util.find_spec("flux_double_stream_patch")
+
     patch_info = {
         "patched": patch_ok,
         "import_failed": import_failed,
         "log_path": COMFY_LOG_PATH,
+        "patch_file_exists": patch_file.exists(),
+        "import_spec_found": patch_spec is not None,
     }
+
+    if patch_spec is not None:
+        patch_info.update(
+            {
+                "import_spec_origin": getattr(patch_spec, "origin", None),
+                "import_spec_submodule_search_locations": list(
+                    patch_spec.submodule_search_locations or []
+                ),
+            }
+        )
+
+    logger.info(
+        "patch diagnostics: exists=%s import_spec=%s origin=%s",
+        patch_info["patch_file_exists"],
+        patch_info["import_spec_found"],
+        patch_info.get("import_spec_origin"),
+    )
 
     if patch_error:
         patch_info["warning"] = "flux_double_stream_patch reported an error during apply."
