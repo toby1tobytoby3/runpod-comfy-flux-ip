@@ -43,8 +43,12 @@ _comfy_process: Optional[subprocess.Popen] = None
 
 def _start_comfy_if_needed():
     global _comfy_process
-    if _comfy_process and _comfy_process.poll() is None:
-        return
+    if _comfy_process:
+        rc = _comfy_process.poll()
+        if rc is None:
+            logger.debug("ComfyUI already running pid=%s", _comfy_process.pid)
+            return
+        logger.warning("ComfyUI process previously exited rc=%s, restarting", rc)
 
     # Extra diagnostics for Flux + patching
     os.environ["TORCH_SHOW_LOADED_KEYS"] = "1"
@@ -255,7 +259,13 @@ def _handle_generate(body):
         return _fail("no workflow provided")
 
     _ensure_comfy_ready()
-    before = {i["path"]: i["mtime"] for i in _scan_outputs()}
+    before_imgs = _scan_outputs()
+    before = {i["path"]: i["mtime"] for i in before_imgs}
+    logger.info(
+        "generate: outputs before=%d latest_mtime=%s",
+        len(before_imgs),
+        max((i["mtime"] for i in before_imgs), default=None),
+    )
 
     try:
         resp = _comfy_post("/prompt", json=workflow)
@@ -267,11 +277,21 @@ def _handle_generate(body):
     new_images, _after = _await_new_outputs(before)
     latest = sorted(new_images, key=lambda x: x["mtime"])[-1] if new_images else None
 
+    logger.info(
+        "generate: new_images=%d latest=%s", len(new_images), latest.get("path") if latest else None
+    )
+
+    debug_note = None
+    if not new_images:
+        debug_note = _tail_file(COMFY_LOG_PATH)
+        logger.warning("generate: no new images detected; comfy log tail attached")
+
     return _ok(
         {
             "prompt_response": prompt_response,
             "new_images": new_images,
             "latest_image": latest,
+            "debug_log_tail": debug_note,
         }
     )
 
