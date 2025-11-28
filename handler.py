@@ -35,224 +35,273 @@ logging.basicConfig(
 )
 logger = logging.getLogger("handler")
 
-# ---------------------------------------------------------------------
-# ComfyUI Process Management
-# ---------------------------------------------------------------------
-_comfy_process: Optional[subprocess.Popen] = None
+import requests
+import runpod
+
+# -----------------------------------------------------------------------------
+# Config / Constants
+# -----------------------------------------------------------------------------
+
+COMFY_BASE = os.environ.get("COMFYUI_BASE_URL", "http://127.0.0.1:8188")
+COMFY_TIMEOUT = float(os.environ.get("COMFYUI_TIMEOUT", "600"))
+COMFY_POLL_INTERVAL = float(os.environ.get("COMFYUI_POLL_INTERVAL", "2.0"))
+
+OUTPUT_DIRS = [
+    "/runpod-volume/ComfyUI/output",
+    "/comfyui/output",
+]
+
+FLUX_BASE_WORKFLOW_PATH = os.environ.get(
+    "FLUX_BASE_WORKFLOW_PATH",
+    "/workspace/workflows/flux_base_api.json",
+)
+
+FLUX_IP_WORKFLOW_PATH = os.environ.get(
+    "FLUX_IP_WORKFLOW_PATH",
+    "/workspace/workflows/flux_ip_api.json",
+)
+
+SAVE_ONLY_WORKFLOW_PATH = os.environ.get(
+    "SAVE_ONLY_WORKFLOW_PATH",
+    "/workspace/workflows/save_only_test.json",
+)
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("handler")
+
+# -----------------------------------------------------------------------------
+# Helpers: Filesystem / Outputs
+# -----------------------------------------------------------------------------
+
+def _list_images() -> List[Dict[str, Any]]:
+    """Return all PNG images in OUTPUT_DIRS with mtime + size."""
+    images: List[Dict[str, Any]] = []
+    for base in OUTPUT_DIRS:
+        if not os.path.isdir(base):
+            continue
+        for name in os.listdir(base):
+            if not name.lower().endswith(".png"):
+                continue
+            full = os.path.join(base, name)
+            try:
+                st = os.stat(full)
+            except FileNotFoundError:
+                continue
+            images.append(
+                {
+                    "name": name,
+                    "path": full,
+                    "mtime": int(st.st_mtime),
+                    "size": st.st_size,
+                }
+            )
+    return images
 
 
-def _start_comfy_if_needed():
-    global _comfy_process
-    if _comfy_process and _comfy_process.poll() is None:
-        return
-
-    # Extra diagnostics for Flux + patching
-    os.environ["TORCH_SHOW_LOADED_KEYS"] = "1"
-    os.environ["PYTHONUNBUFFERED"] = "1"
-    os.environ["COMFYUI_VERBOSE_STARTUP"] = "1"
-
-    cmd = [
-        COMFY_PYTHON,
-        "main.py",
-        "--listen",
-        "0.0.0.0",
-        "--port",
-        str(COMFY_PORT),
-    ]
-
-    log_path = pathlib.Path(COMFY_LOG_PATH)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open("a", buffering=1)
-
-    logger.info("Launching ComfyUI with verbose logging...")
-    _comfy_process = subprocess.Popen(
-        cmd,
-        cwd=COMFY_DIR,
-        stdout=log_file,
-        stderr=log_file,
-        text=True,
-    )
-    logger.info(f"Started ComfyUI pid={_comfy_process.pid}, log={COMFY_LOG_PATH}")
-
-
-def _wait_for_comfy_ready(timeout: float = 90.0):
-    start = time.time()
-    while True:
-        try:
-            resp = requests.get(f"{COMFY_BASE}/system_stats", timeout=5)
-            if resp.ok:
-                logger.info("ComfyUI ready.")
-                return
-        except Exception as e:
-            logger.debug(f"Waiting for ComfyUI: {e}")
-        if time.time() - start > timeout:
-            raise RuntimeError("Timed out waiting for ComfyUI startup")
-        time.sleep(1)
-
-
-def _ensure_comfy_ready():
-    _start_comfy_if_needed()
-    _wait_for_comfy_ready()
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def _ok(data):
-    return {"ok": True, "data": data}
-
-
-def _fail(msg, *, error=None):
-    logger.error(msg)
-    return {"ok": False, "error": error or msg}
-
-
-def _comfy_post(path, *, json=None, timeout=None):
-    return requests.post(
-        f"{COMFY_BASE}{path}",
-        json=json,
-        timeout=timeout or COMFY_REQUEST_TIMEOUT,
-    )
-
-
-def _scan_outputs():
-    imgs = []
-    for d in OUTPUT_SCAN_DIRS:
-        for root, _, files in os.walk(d):
-            for f in files:
-                if f.lower().endswith(".png"):
-                    p = pathlib.Path(root) / f
-                    try:
-                        s = p.stat()
-                    except Exception:
-                        continue
-                    imgs.append(
-                        {
-                            "path": str(p),
-                            "name": p.name,
-                            "mtime": int(s.st_mtime),
-                            "size": s.st_size,
-                        }
-                    )
-    imgs.sort(key=lambda x: x["mtime"])
-    return imgs
-
-
-def _await_new_outputs(
-    before,
-    wait_seconds: float = COMFY_OUTPUT_WAIT_SECONDS,
-    poll_interval: float = COMFY_OUTPUT_POLL_INTERVAL,
-):
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline:
-        imgs = _scan_outputs()
-        new = [
-            i
-            for i in imgs
-            if i["path"] not in before or i["mtime"] > before[i["path"]]
-        ]
-        if new:
-            return new, {i["path"]: i["mtime"] for i in imgs}
-        time.sleep(poll_interval)
-    return [], before
-
-
-def _tail_file(path, max_bytes: int = 8192) -> str:
-    try:
-        p = pathlib.Path(path)
-        if not p.exists():
-            return f"(no log at {path})"
-        size = p.stat().st_size
-        with p.open("rb") as f:
-            if size > max_bytes:
-                f.seek(-max_bytes, os.SEEK_END)
-            return f.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"(error reading log: {e})"
-
-# ---------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------
-def _handle_ping():
-    return _ok({"message": "pong"})
-
-
-def _handle_preflight():
+def _snapshot_outputs() -> Dict[str, Dict[str, Any]]:
     """
-    - Ensures ComfyUI is running
-    - Returns system_stats
-    - Also reports whether flux_double_stream_patch appears to have applied.
+    Take a snapshot of images keyed by absolute path.
+    Used to detect new images after a Comfy prompt.
     """
-    _ensure_comfy_ready()
-    try:
-        stats = requests.get(f"{COMFY_BASE}/system_stats", timeout=10).json()
-    except Exception as e:
-        return _fail(f"preflight failed: {e}")
+    snap = {}
+    for img in _list_images():
+        snap[img["path"]] = img
+    return snap
 
-    # Check patch status from log
-    tail = _tail_file(COMFY_LOG_PATH)
-    patch_ok = "flux_double_stream_patch: DoubleStreamBlock.forward patched successfully" in tail
-    patch_error = "flux_double_stream_patch: could not apply patch" in tail
-    import_failed = "IMPORT FAILED" in tail and "flux_double_stream_patch.py" in tail
 
-    patch_file = pathlib.Path("/comfyui/custom_nodes/flux_double_stream_patch.py")
-    patch_spec = importlib.util.find_spec("flux_double_stream_patch")
+def _diff_outputs(
+    before: Dict[str, Dict[str, Any]],
+    after: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Return images that are new (or modified) between two snapshots.
+    """
+    new_images: List[Dict[str, Any]] = []
+    for path, meta in after.items():
+        if path not in before:
+            new_images.append(meta)
+            continue
+        if meta["mtime"] != before[path]["mtime"] or meta["size"] != before[path]["size"]:
+            new_images.append(meta)
+    return new_images
 
-    patch_info = {
-        "patched": patch_ok,
-        "import_failed": import_failed,
-        "log_path": COMFY_LOG_PATH,
-        "patch_file_exists": patch_file.exists(),
-        "import_spec_found": patch_spec is not None,
+# -----------------------------------------------------------------------------
+# Helpers: HTTP / ComfyUI
+# -----------------------------------------------------------------------------
+
+def _comfy_get(path: str, **kwargs) -> requests.Response:
+    url = f"{COMFY_BASE.rstrip('/')}{path}"
+    log.info(f"GET {url}")
+    return requests.get(url, timeout=COMFY_TIMEOUT, **kwargs)
+
+
+def _comfy_post(path: str, json: Dict[str, Any], **kwargs) -> requests.Response:
+    url = f"{COMFY_BASE.rstrip('/')}{path}"
+    log.info(f"POST {url}")
+    return requests.post(url, json=json, timeout=COMFY_TIMEOUT, **kwargs)
+
+# -----------------------------------------------------------------------------
+# Workflow Loading
+# -----------------------------------------------------------------------------
+
+def _load_workflow(path: str) -> Dict[str, Any]:
+    """Load a workflow JSON file from disk."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"workflow not found at {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# -----------------------------------------------------------------------------
+# Core Actions
+# -----------------------------------------------------------------------------
+
+def _handle_ping(body: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "data": {"message": "pong"}}
+
+
+def _handle_about(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a small description of what this worker does and where it stores things.
+    """
+    return {
+        "ok": True,
+        "data": {
+            "description": "ImagineWorlds × RunPod ComfyUI FLUX worker with IP-Adapter.",
+            "comfy_base": COMFY_BASE,
+            "output_dirs": OUTPUT_DIRS,
+            "workflows": {
+                "flux_base": FLUX_BASE_WORKFLOW_PATH,
+                "flux_ip": FLUX_IP_WORKFLOW_PATH,
+                "save_only": SAVE_ONLY_WORKFLOW_PATH,
+            },
+        },
     }
 
-    if patch_spec is not None:
-        patch_info.update(
-            {
-                "import_spec_origin": getattr(patch_spec, "origin", None),
-                "import_spec_submodule_search_locations": list(
-                    patch_spec.submodule_search_locations or []
-                ),
-            }
-        )
 
-    logger.info(
-        "patch diagnostics: exists=%s import_spec=%s origin=%s",
-        patch_info["patch_file_exists"],
-        patch_info["import_spec_found"],
-        patch_info.get("import_spec_origin"),
-    )
+def _handle_list_outputs(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return the list of all current PNG outputs in the configured output dirs.
+    """
+    images = sorted(_list_images(), key=lambda x: x["mtime"])
+    return {"ok": True, "data": {"images": images}}
 
-    if patch_error:
-        patch_info["warning"] = "flux_double_stream_patch reported an error during apply."
-    if not patch_ok and not import_failed:
-        patch_info.setdefault("note", "No explicit success line yet — patch may apply only on first model use.")
 
-    return _ok(
-        {
-            "system_stats": stats,
-            "flux_double_stream_patch": patch_info,
+def _ensure_comfy_ready() -> None:
+    """
+    Hit /system_stats or /prompt to ensure ComfyUI is up before sending workflows.
+    """
+    try:
+        resp = _comfy_get("/system_stats")
+        resp.raise_for_status()
+        log.info("ComfyUI /system_stats OK")
+        return
+    except Exception as e:
+        log.warning(f"/system_stats failed: {e}")
+
+    try:
+        resp = _comfy_get("/prompt")
+        resp.raise_for_status()
+        log.info("ComfyUI /prompt OK")
+    except Exception as e:
+        log.error(f"ComfyUI not ready: {e}")
+        raise
+
+# -----------------------------------------------------------------------------
+# Generation
+# -----------------------------------------------------------------------------
+
+def _await_new_outputs(
+    before: Dict[str, Dict[str, Any]],
+    timeout: float = COMFY_TIMEOUT,
+    poll_interval: float = COMFY_POLL_INTERVAL,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """
+    Poll output directories until new images appear or timeout is reached.
+    """
+    start = time.time()
+    while True:
+        after = _snapshot_outputs()
+        new_images = _diff_outputs(before, after)
+        if new_images:
+            return new_images, after
+        if time.time() - start > timeout:
+            log.warning("Timed out waiting for new images.")
+            return [], after
+        time.sleep(poll_interval)
+
+# -----------------------------------------------------------------------------
+# High-Level Generate Handler
+# -----------------------------------------------------------------------------
+
+def _build_flux_base_workflow(prompt: str) -> Dict[str, Any]:
+    """
+    Build a FLUX base workflow payload from the template, injecting the prompt.
+    """
+    workflow = _load_workflow(FLUX_BASE_WORKFLOW_PATH)
+    # Assume the workflow uses a 'client_id' & a text node for the prompt.
+    workflow.setdefault("client_id", "flux_client")
+    # If your template has a specific node that holds the prompt, update it here.
+    # This will depend on your saved workflow. Example:
+    # workflow["7"]["inputs"]["text"] = prompt
+    # For now, we just store the prompt in a top-level field for debugging.
+    workflow["prompt_text"] = prompt
+    return workflow
+
+
+def _build_flux_ip_workflow(prompt: str, ip_image_path: str) -> Dict[str, Any]:
+    """
+    Build a FLUX + IP-Adapter workflow payload from the template, injecting
+    both text prompt and IP adapter image path.
+    """
+    workflow = _load_workflow(FLUX_IP_WORKFLOW_PATH)
+    workflow.setdefault("client_id", "flux_ip_client")
+
+    # Same comment as _build_flux_base_workflow: you will want to set the
+    # appropriate text node & IP adapter node inputs to match your template.
+    workflow["prompt_text"] = prompt
+    workflow["ip_image"] = ip_image_path
+    return workflow
+
+
+def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle generic 'generate' / 'generate_flux' / 'generate_flux_ip' actions.
+
+    Expected input payload:
+    {
+        "mode": "flux_base" | "flux_ip",
+        "prompt": "text prompt",
+        "ip_image_path": "/runpod-volume/ComfyUI/input/ref.png"  # required for flux_ip
+    }
+    """
+    _ensure_comfy_ready()
+
+    mode = body.get("mode", "flux_base")
+    prompt = body.get("prompt", "a test image from flux")
+    ip_image_path = body.get("ip_image_path")
+
+    if mode not in ("flux_base", "flux_ip"):
+        return {
+            "ok": False,
+            "error": f"unsupported mode: {mode}",
         }
-    )
 
+    # Take a snapshot of outputs before we trigger the workflow.
+    before = _snapshot_outputs()
 
-def _handle_dump_comfy_log(body):
-    lines = int(body.get("lines", 400))
-    tail = _tail_file(COMFY_LOG_PATH)
-    tail_lines = tail.splitlines()
-    if len(tail_lines) > lines:
-        tail = "\n".join(tail_lines[-lines:])
-    return _ok({"log_tail": tail, "path": COMFY_LOG_PATH})
+    # Build workflow
+    if mode == "flux_ip":
+        if not ip_image_path:
+            return {
+                "ok": False,
+                "error": "ip_image_path is required for flux_ip mode",
+            }
+        workflow = _build_flux_ip_workflow(prompt, ip_image_path)
+    else:
+        workflow = _build_flux_base_workflow(prompt)
 
-
-def _handle_list_all_outputs():
-    return _ok({"images": _scan_outputs()})
-
-
-def _handle_generate(body):
-    payload = body.get("payload") or {}
-    workflow = payload.get("workflow") or payload.get("prompt")
-    if not workflow:
-        return _fail("no workflow provided")
+    # Force a unique prompt_id every time so Comfy doesn't reuse previous results.
+    workflow["prompt_id"] = f"flux_{mode}_{uuid.uuid4()}"
 
     workflow["prompt_id"] = f"fluxip_{uuid.uuid4()}"
 
@@ -268,47 +317,133 @@ def _handle_generate(body):
 
     before = {i["path"]: i["mtime"] for i in _scan_outputs()}
 
+    # Send workflow to Comfy
     try:
         resp = _comfy_post("/prompt", json=workflow)
         resp.raise_for_status()
         prompt_response = resp.json()
     except Exception as e:
-        return _fail(f"generate failed: {e}")
+        return {
+            "ok": False,
+            "error": f"generate failed: {e}",
+        }
 
+    # Wait for new images
     new_images, _after = _await_new_outputs(before)
-    latest = sorted(new_images, key=lambda x: x["mtime"])[-1] if new_images else None
+    latest = (
+        sorted(new_images, key=lambda x: x["mtime"])[-1]
+        if new_images
+        else None
+    )
 
-    return _ok(
-        {
+    return {
+        "ok": True,
+        "data": {
             "prompt_response": prompt_response,
             "new_images": new_images,
             "latest_image": latest,
-        }
-    )
+        },
+    }
 
+# -----------------------------------------------------------------------------
+# Preflight
+# -----------------------------------------------------------------------------
 
-def handler(event):
-    inp = (event or {}).get("input") or {}
-    action = inp.get("action")
-    body = {"payload": inp.get("payload")}
+def _handle_preflight(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Do some health checks:
+      - can we reach ComfyUI?
+      - are the output directories accessible?
+      - does the flux_double_stream_patch appear to have loaded?
+    """
+    status: Dict[str, Any] = {
+        "comfy_reachable": False,
+        "output_dirs": {},
+        "flux_double_stream_patch": {
+            "import_failed": False,
+            "patched": False,
+            "log_path": "/tmp/comfy.log",
+            "note": "No explicit success line yet — patch may apply only on first model use.",
+        },
+        "system_stats": None,
+    }
 
-    logger.info(f"handler action={action}")
-
+    # Check ComfyUI
     try:
-        if action == "ping":
-            return _handle_ping()
-        if action == "preflight":
-            return _handle_preflight()
-        if action == "dump_comfy_log":
-            return _handle_dump_comfy_log(body)
-        if action == "list_all_outputs":
-            return _handle_list_all_outputs()
-        if action == "generate":
-            return _handle_generate(body)
-        return _fail(f"unknown action: {action}")
+        resp = _comfy_get("/system_stats")
+        resp.raise_for_status()
+        status["comfy_reachable"] = True
+        status["system_stats"] = resp.json()
     except Exception as e:
-        logger.exception("Unhandled exception in handler")
-        return _fail(str(e))
+        status["comfy_reachable"] = False
+        status["system_stats"] = {"error": str(e)}
+
+    # Check output dirs
+    for d in OUTPUT_DIRS:
+        if not os.path.isdir(d):
+            status["output_dirs"][d] = {"exists": False, "writable": False}
+            continue
+        writable = os.access(d, os.W_OK)
+        status["output_dirs"][d] = {"exists": True, "writable": writable}
+
+    # Inspect /tmp/comfy.log for our patch signals (best-effort).
+    log_path = status["flux_double_stream_patch"]["log_path"]
+    if os.path.isfile(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                tail = f.readlines()[-200:]
+            tail_text = "".join(tail)
+            status["flux_double_stream_patch"]["patched"] = (
+                "flux_double_stream_patch" in tail_text
+                and "patched DoubleStreamBlock.forward" in tail_text
+            )
+        except Exception:
+            pass
+
+    return {"ok": True, "data": status}
+
+# -----------------------------------------------------------------------------
+# RunPod Handler
+# -----------------------------------------------------------------------------
+
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RunPod serverless handler.
+
+    'event' is the RunPod job payload:
+    {
+      "id": "...",
+      "input": {
+         "action": "...",
+         ...
+      }
+    }
+    """
+    log.info(f"handler received event: {event}")
+
+    body = event.get("input", {}) if isinstance(event, dict) else {}
+    if not isinstance(body, dict):
+        return {
+            "ok": False,
+            "error": f"input must be an object, got {type(body)}",
+        }
+
+    action = body.get("action")
+    if not action:
+        return {"ok": False, "error": "missing 'action' in input"}
+
+    if action == "ping":
+        return _handle_ping(body)
+    if action == "about":
+        return _handle_about(body)
+    if action == "list_all_outputs":
+        return _handle_list_outputs(body)
+    if action in ("generate", "generate_flux", "generate_flux_ip"):
+        return _handle_generate(body)
+    if action == "preflight":
+        return _handle_preflight(body)
+
+    return {"ok": False, "error": f"unknown action: {action}"}
 
 
 runpod.serverless.start({"handler": handler})
