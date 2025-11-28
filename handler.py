@@ -1,4 +1,4 @@
-import importlib.util, json, logging, os, pathlib, time, subprocess, requests, runpod
+import importlib, importlib.util, json, logging, os, pathlib, time, subprocess, requests, runpod, uuid
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------
@@ -254,7 +254,18 @@ def _handle_generate(body):
     if not workflow:
         return _fail("no workflow provided")
 
+    workflow["prompt_id"] = f"fluxip_{uuid.uuid4()}"
+
     _ensure_comfy_ready()
+
+    try:
+        import flux_double_stream_patch
+
+        importlib.reload(flux_double_stream_patch)
+        logger.info("Reloaded flux_double_stream_patch before dispatch.")
+    except Exception as e:
+        logger.warning("Could not reload flux_double_stream_patch: %s", e)
+
     before = {i["path"]: i["mtime"] for i in _scan_outputs()}
 
     try:
