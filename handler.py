@@ -1,9 +1,39 @@
-import os
-import time
-import uuid
-import json
-import logging
-from typing import Any, Dict, List, Tuple
+import importlib, importlib.util, json, logging, os, pathlib, time, subprocess, requests, runpod, uuid
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------
+# Env / Config
+# ---------------------------------------------------------------------
+COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
+COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
+COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
+COMFY_DIR = os.getenv("COMFY_DIR", "/comfyui")
+COMFY_PYTHON = os.getenv("COMFY_PYTHON", "/opt/venv/bin/python")
+COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
+COMFY_REQUEST_TIMEOUT = float(os.getenv("COMFY_REQUEST_TIMEOUT", "60.0"))
+COMFY_OUTPUT_WAIT_SECONDS = float(os.getenv("COMFY_OUTPUT_WAIT_SECONDS", "300"))
+COMFY_OUTPUT_POLL_INTERVAL = float(os.getenv("COMFY_OUTPUT_POLL_INTERVAL", "5.0"))
+
+INPUT_DIR = os.getenv("INPUT_DIR", "/runpod-volume/ComfyUI/input")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/runpod-volume/ComfyUI/output")
+OUTPUT_SCAN_DIRS = [
+    OUTPUT_DIR,
+    "/runpod-volume/ComfyUI/output",
+    "/comfyui/output",
+    "/comfyui/user/output",
+    "/workspace/ComfyUI/output",
+]
+for d in OUTPUT_SCAN_DIRS:
+    pathlib.Path(d).mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+)
+logger = logging.getLogger("handler")
 
 import requests
 import runpod
@@ -273,15 +303,19 @@ def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
     # Force a unique prompt_id every time so Comfy doesn't reuse previous results.
     workflow["prompt_id"] = f"flux_{mode}_{uuid.uuid4()}"
 
-    # Best-effort: tell Comfy to clear any cached prompt results before we run.
+    workflow["prompt_id"] = f"fluxip_{uuid.uuid4()}"
+
+    _ensure_comfy_ready()
+
     try:
-        requests.post(
-            f"{COMFY_BASE.rstrip('/')}/prompt",
-            json={"clear": True},
-            timeout=5,
-        )
+        import flux_double_stream_patch
+
+        importlib.reload(flux_double_stream_patch)
+        logger.info("Reloaded flux_double_stream_patch before dispatch.")
     except Exception as e:
-        log.warning(f"Failed to send clear prompt request: {e}")
+        logger.warning("Could not reload flux_double_stream_patch: %s", e)
+
+    before = {i["path"]: i["mtime"] for i in _scan_outputs()}
 
     # Send workflow to Comfy
     try:
