@@ -1,251 +1,185 @@
-import importlib.util, json, logging, os, pathlib, time, subprocess, requests, runpod
+import importlib.util, json, logging, os, pathlib, time, subprocess, uuid, requests, runpod
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------
 # Env / Config
 # ---------------------------------------------------------------------
-COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
-COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
-COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_DIR = os.getenv("COMFY_DIR", "/comfyui")
-COMFY_PYTHON = os.getenv("COMFY_PYTHON", "/opt/venv/bin/python")
-COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
-COMFY_REQUEST_TIMEOUT = float(os.getenv("COMFY_REQUEST_TIMEOUT", "60.0"))
-COMFY_OUTPUT_WAIT_SECONDS = float(os.getenv("COMFY_OUTPUT_WAIT_SECONDS", "300"))
-COMFY_OUTPUT_POLL_INTERVAL = float(os.getenv("COMFY_OUTPUT_POLL_INTERVAL", "5.0"))
 
-INPUT_DIR = os.getenv("INPUT_DIR", "/runpod-volume/ComfyUI/input")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/runpod-volume/ComfyUI/output")
-OUTPUT_SCAN_DIRS = [
-    OUTPUT_DIR,
-    "/runpod-volume/ComfyUI/output",
-    "/comfyui/output",
-    "/comfyui/user/output",
-    "/workspace/ComfyUI/output",
+COMFY_BASE = os.environ.get("COMFY_BASE", "http://127.0.0.1:8188")
+COMFY_PY = os.environ.get("COMFY_PY", "/opt/venv/bin/python")
+COMFY_MAIN = os.environ.get("COMFY_MAIN", "/comfyui/main.py")
+OUTPUT_DIRS = [
+    pathlib.Path("/runpod-volume/ComfyUI/output"),
+    pathlib.Path("/comfyui/output"),
 ]
-for d in OUTPUT_SCAN_DIRS:
-    pathlib.Path(d).mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-)
 logger = logging.getLogger("handler")
+logging.basicConfig(level=logging.INFO)
 
-# ---------------------------------------------------------------------
-# ComfyUI Process Management
-# ---------------------------------------------------------------------
-_comfy_process: Optional[subprocess.Popen] = None
-
-
-def _start_comfy_if_needed():
-    global _comfy_process
-    if _comfy_process and _comfy_process.poll() is None:
-        return
-
-    # Extra diagnostics for Flux + patching
-    os.environ["TORCH_SHOW_LOADED_KEYS"] = "1"
-    os.environ["PYTHONUNBUFFERED"] = "1"
-    os.environ["COMFYUI_VERBOSE_STARTUP"] = "1"
-
-    cmd = [
-        COMFY_PYTHON,
-        "main.py",
-        "--listen",
-        "0.0.0.0",
-        "--port",
-        str(COMFY_PORT),
-    ]
-
-    log_path = pathlib.Path(COMFY_LOG_PATH)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open("a", buffering=1)
-
-    logger.info("Launching ComfyUI with verbose logging...")
-    _comfy_process = subprocess.Popen(
-        cmd,
-        cwd=COMFY_DIR,
-        stdout=log_file,
-        stderr=log_file,
-        text=True,
-    )
-    logger.info(f"Started ComfyUI pid={_comfy_process.pid}, log={COMFY_LOG_PATH}")
-
-
-def _wait_for_comfy_ready(timeout: float = 90.0):
-    start = time.time()
-    while True:
-        try:
-            resp = requests.get(f"{COMFY_BASE}/system_stats", timeout=5)
-            if resp.ok:
-                logger.info("ComfyUI ready.")
-                return
-        except Exception as e:
-            logger.debug(f"Waiting for ComfyUI: {e}")
-        if time.time() - start > timeout:
-            raise RuntimeError("Timed out waiting for ComfyUI startup")
-        time.sleep(1)
-
-
-def _ensure_comfy_ready():
-    _start_comfy_if_needed()
-    _wait_for_comfy_ready()
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-def _ok(data):
-    return {"ok": True, "data": data}
 
 
-def _fail(msg, *, error=None):
-    logger.error(msg)
-    return {"ok": False, "error": error or msg}
+def _ok(data: Any = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "data": data,
+        "meta": meta or {},
+    }
 
 
-def _comfy_post(path, *, json=None, timeout=None):
-    return requests.post(
-        f"{COMFY_BASE}{path}",
-        json=json,
-        timeout=timeout or COMFY_REQUEST_TIMEOUT,
-    )
+def _fail(message: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    logger.error("FAIL: %s", message)
+    return {
+        "ok": False,
+        "error": message,
+        "meta": meta or {},
+    }
 
 
-def _scan_outputs():
-    imgs = []
-    for d in OUTPUT_SCAN_DIRS:
-        for root, _, files in os.walk(d):
-            for f in files:
-                if f.lower().endswith(".png"):
-                    p = pathlib.Path(root) / f
-                    try:
-                        s = p.stat()
-                    except Exception:
-                        continue
-                    imgs.append(
-                        {
-                            "path": str(p),
-                            "name": p.name,
-                            "mtime": int(s.st_mtime),
-                            "size": s.st_size,
-                        }
-                    )
-    imgs.sort(key=lambda x: x["mtime"])
-    return imgs
+def _comfy_get(path: str, **kwargs) -> requests.Response:
+    url = f"{COMFY_BASE}{path}"
+    logger.info("GET %s", url)
+    resp = requests.get(url, timeout=kwargs.pop("timeout", 20), **kwargs)
+    return resp
 
 
-def _await_new_outputs(
-    before,
-    wait_seconds: float = COMFY_OUTPUT_WAIT_SECONDS,
-    poll_interval: float = COMFY_OUTPUT_POLL_INTERVAL,
-):
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline:
-        imgs = _scan_outputs()
-        new = [
-            i
-            for i in imgs
-            if i["path"] not in before or i["mtime"] > before[i["path"]]
-        ]
-        if new:
-            return new, {i["path"]: i["mtime"] for i in imgs}
+def _comfy_post(path: str, **kwargs) -> requests.Response:
+    url = f"{COMFY_BASE}{path}"
+    logger.info("POST %s", url)
+    resp = requests.post(url, timeout=kwargs.pop("timeout", 20), **kwargs)
+    return resp
+
+
+def _ensure_comfy_ready(timeout: int = 120) -> None:
+    """
+    Try /history and /health-check. If ComfyUI is not up, try to start it
+    once and then wait until it responds or we time out.
+    """
+    start = time.time()
+
+    def is_ready() -> bool:
+        try:
+            resp = _comfy_get("/history")
+            if resp.ok:
+                return True
+        except Exception:
+            pass
+
+        try:
+            resp = _comfy_get("/health-check")
+            if resp.ok:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    if is_ready():
+        logger.info("ComfyUI already ready.")
+        return
+
+    # Try to launch ComfyUI once.
+    logger.warning("ComfyUI not ready, attempting to launch it...")
+    try:
+        subprocess.Popen(
+            [COMFY_PY, COMFY_MAIN, "--listen", "0.0.0.0", "--port", "8188"],
+            cwd="/comfyui",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        logger.info("Launched ComfyUI with %s %s ...", COMFY_PY, COMFY_MAIN)
+    except Exception as e:
+        logger.exception("Failed to launch ComfyUI: %s", e)
+        raise
+
+    # Poll until ready or timeout
+    while time.time() - start < timeout:
+        if is_ready():
+            logger.info("ComfyUI became ready after launch.")
+            return
+        time.sleep(2)
+
+    raise RuntimeError("ComfyUI did not become ready within timeout.")
+
+
+def _list_outputs() -> List[Dict[str, Any]]:
+    images = []
+    for root in OUTPUT_DIRS:
+        if not root.exists():
+            continue
+        for p in root.glob("*.png"):
+            try:
+                stat = p.stat()
+                images.append(
+                    {
+                        "name": p.name,
+                        "path": str(p),
+                        "mtime": int(stat.st_mtime),
+                        "size": stat.st_size,
+                    }
+                )
+            except Exception as e:
+                logger.warning("Failed to stat %s: %s", p, e)
+    images.sort(key=lambda x: x["mtime"])
+    return images
+
+
+def _scan_outputs() -> List[Dict[str, Any]]:
+    return _list_outputs()
+
+
+def _await_new_outputs(before: Dict[str, int], timeout: int = 300, poll_interval: float = 3.0):
+    """
+    Wait for new or updated files compared to 'before' mapping of path->mtime.
+    Returns (new_images, after_mapping).
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        after_all = _scan_outputs()
+        after_map = {i["path"]: i["mtime"] for i in after_all}
+
+        new_images = []
+        for img in after_all:
+            old_mtime = before.get(img["path"])
+            if old_mtime is None or img["mtime"] > old_mtime:
+                new_images.append(img)
+
+        if new_images:
+            return new_images, after_map
+
         time.sleep(poll_interval)
+
     return [], before
 
 
-def _tail_file(path, max_bytes: int = 8192) -> str:
-    try:
-        p = pathlib.Path(path)
-        if not p.exists():
-            return f"(no log at {path})"
-        size = p.stat().st_size
-        with p.open("rb") as f:
-            if size > max_bytes:
-                f.seek(-max_bytes, os.SEEK_END)
-            return f.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"(error reading log: {e})"
+# ---------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------
-def _handle_ping():
+
+def _handle_ping(body):
     return _ok({"message": "pong"})
 
 
-def _handle_preflight():
-    """
-    - Ensures ComfyUI is running
-    - Returns system_stats
-    - Also reports whether flux_double_stream_patch appears to have applied.
-    """
-    _ensure_comfy_ready()
-    try:
-        stats = requests.get(f"{COMFY_BASE}/system_stats", timeout=10).json()
-    except Exception as e:
-        return _fail(f"preflight failed: {e}")
-
-    # Check patch status from log
-    tail = _tail_file(COMFY_LOG_PATH)
-    patch_ok = "flux_double_stream_patch: DoubleStreamBlock.forward patched successfully" in tail
-    patch_error = "flux_double_stream_patch: could not apply patch" in tail
-    import_failed = "IMPORT FAILED" in tail and "flux_double_stream_patch.py" in tail
-
-    patch_file = pathlib.Path("/comfyui/custom_nodes/flux_double_stream_patch.py")
-    patch_spec = importlib.util.find_spec("flux_double_stream_patch")
-
-    patch_info = {
-        "patched": patch_ok,
-        "import_failed": import_failed,
-        "log_path": COMFY_LOG_PATH,
-        "patch_file_exists": patch_file.exists(),
-        "import_spec_found": patch_spec is not None,
+def _handle_about(body):
+    info = {
+        "message": "ImagineWorlds × RunPod · Flux + IP Adapter Worker",
+        "comfy_base": COMFY_BASE,
+        "output_dirs": [str(p) for p in OUTPUT_DIRS],
     }
-
-    if patch_spec is not None:
-        patch_info.update(
-            {
-                "import_spec_origin": getattr(patch_spec, "origin", None),
-                "import_spec_submodule_search_locations": list(
-                    patch_spec.submodule_search_locations or []
-                ),
-            }
-        )
-
-    logger.info(
-        "patch diagnostics: exists=%s import_spec=%s origin=%s",
-        patch_info["patch_file_exists"],
-        patch_info["import_spec_found"],
-        patch_info.get("import_spec_origin"),
-    )
-
-    if patch_error:
-        patch_info["warning"] = "flux_double_stream_patch reported an error during apply."
-    if not patch_ok and not import_failed:
-        patch_info.setdefault("note", "No explicit success line yet — patch may apply only on first model use.")
-
-    return _ok(
-        {
-            "system_stats": stats,
-            "flux_double_stream_patch": patch_info,
-        }
-    )
+    try:
+        resp = _comfy_get("/history")
+        info["comfy_history_ok"] = resp.ok
+    except Exception as e:
+        info["comfy_history_error"] = str(e)
+    return _ok(info)
 
 
-def _handle_dump_comfy_log(body):
-    lines = int(body.get("lines", 400))
-    tail = _tail_file(COMFY_LOG_PATH)
-    tail_lines = tail.splitlines()
-    if len(tail_lines) > lines:
-        tail = "\n".join(tail_lines[-lines:])
-    return _ok({"log_tail": tail, "path": COMFY_LOG_PATH})
-
-
-def _handle_list_all_outputs():
-    return _ok({"images": _scan_outputs()})
+def _handle_list_outputs(body):
+    return _ok({"images": _list_outputs()})
 
 
 def _handle_generate(body):
@@ -254,7 +188,20 @@ def _handle_generate(body):
     if not workflow:
         return _fail("no workflow provided")
 
+    # Ensure a unique prompt_id for every run so ComfyUI history/results don't clash
+    try:
+        workflow["prompt_id"] = f"fluxip_{uuid.uuid4()}"
+    except Exception as e:
+        logger.warning("Failed to set custom prompt_id: %s", e)
+
     _ensure_comfy_ready()
+
+    # Clear any previous ComfyUI prompt state to avoid collisions between runs
+    try:
+        requests.post(f"{COMFY_BASE}/prompt", json={"clear": True}, timeout=5)
+    except Exception as e:
+        logger.warning("Failed to clear ComfyUI prompt state: %s", e)
+
     before = {i["path"]: i["mtime"] for i in _scan_outputs()}
 
     try:
@@ -276,28 +223,63 @@ def _handle_generate(body):
     )
 
 
-def handler(event):
-    inp = (event or {}).get("input") or {}
-    action = inp.get("action")
-    body = {"payload": inp.get("payload")}
-
-    logger.info(f"handler action={action}")
+def _handle_preflight(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Light-weight check that:
+    - ComfyUI is reachable
+    - core endpoints work
+    - output dirs are visible
+    """
+    try:
+        _ensure_comfy_ready()
+    except Exception as e:
+        return _fail(f"preflight: ComfyUI not ready: {e}")
 
     try:
-        if action == "ping":
-            return _handle_ping()
-        if action == "preflight":
-            return _handle_preflight()
-        if action == "dump_comfy_log":
-            return _handle_dump_comfy_log(body)
-        if action == "list_all_outputs":
-            return _handle_list_all_outputs()
-        if action == "generate":
-            return _handle_generate(body)
-        return _fail(f"unknown action: {action}")
+        hist = _comfy_get("/history")
+        hist_ok = hist.ok
+        hist_status = hist.status_code
     except Exception as e:
-        logger.exception("Unhandled exception in handler")
-        return _fail(str(e))
+        hist_ok = False
+        hist_status = str(e)
+
+    outputs = _list_outputs()
+
+    return _ok(
+        {
+            "comfy_history_ok": hist_ok,
+            "comfy_history_status": hist_status,
+            "output_sample": outputs[-3:],
+        }
+    )
+
+
+# ---------------------------------------------------------------------
+# RunPod handler
+# ---------------------------------------------------------------------
+
+
+def handler(event: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RunPod entrypoint.
+    """
+    body = event.get("input") or {}
+    action = body.get("action") or "ping"
+
+    logger.info("handler.action=%s", action)
+
+    if action == "ping":
+        return _handle_ping(body)
+    if action == "about":
+        return _handle_about(body)
+    if action == "list_all_outputs":
+        return _handle_list_outputs(body)
+    if action in ("generate", "generate_flux", "generate_flux_ip"):
+        return _handle_generate(body)
+    if action == "preflight":
+        return _handle_preflight(body)
+
+    return _fail(f"unknown action: {action}")
 
 
 runpod.serverless.start({"handler": handler})
