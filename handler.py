@@ -253,47 +253,109 @@ def _handle_list_all_outputs():
 
 
 def _handle_generate(body):
-    payload = body.get("payload") or {}
-    workflow = payload.get("workflow") or payload.get("prompt")
-    if not workflow:
-        return _fail("no workflow provided")
+    """
+    Generate an image via ComfyUI using a provided workflow/prompt.
 
+    Adds detailed timing so we can see where the time is actually spent:
+      - comfy_ready: time spent ensuring ComfyUI is up
+      - prompt_submit: time to POST the workflow to /prompt
+      - wait_outputs: time spent polling the output directory
+      - total: end-to-end time inside this handler
+    """
+    payload = body.get("payload") or {}
+    # support both {"payload": {"workflow": {...}}} and {"payload": {"prompt": {...}}}
+    workflow = payload.get("workflow") or payload.get("prompt")
+
+    if not workflow:
+        return {
+            "ok": False,
+            "error": "No workflow/prompt provided in payload.workflow or payload.prompt",
+        }
+
+    # ── 1. Time ComfyUI startup / readiness ──────────────────────────────────────
+    t_start = time.time()
     _ensure_comfy_ready()
-    before_imgs = _scan_outputs()
-    before = {i["path"]: i["mtime"] for i in before_imgs}
+    t_ready = time.time()
+
+    # ── 2. Snapshot outputs before we fire the workflow ──────────────────────────
+    before_all = _scan_outputs()
+    before = {img["path"]: img["mtime"] for img in before_all}
+    latest_mtime = max(before.values()) if before else 0
     logger.info(
         "generate: outputs before=%d latest_mtime=%s",
-        len(before_imgs),
-        max((i["mtime"] for i in before_imgs), default=None),
+        len(before),
+        latest_mtime,
     )
 
+    # ── 3. POST the workflow to ComfyUI and time the submit ──────────────────────
+    t_before_prompt = time.time()
     try:
         resp = _comfy_post("/prompt", json=workflow)
         resp.raise_for_status()
         prompt_response = resp.json()
     except Exception as e:
-        return _fail(f"generate failed: {e}")
-
-    new_images, _after = _await_new_outputs(before)
-    latest = sorted(new_images, key=lambda x: x["mtime"])[-1] if new_images else None
-
-    logger.info(
-        "generate: new_images=%d latest=%s", len(new_images), latest.get("path") if latest else None
-    )
-
-    debug_note = None
-    if not new_images:
-        debug_note = _tail_file(COMFY_LOG_PATH)
-        logger.warning("generate: no new images detected; comfy log tail attached")
-
-    return _ok(
-        {
-            "prompt_response": prompt_response,
-            "new_images": new_images,
-            "latest_image": latest,
-            "debug_log_tail": debug_note,
+        t_after_prompt = time.time()
+        logger.exception("generate: failed to submit prompt to ComfyUI")
+        return {
+            "ok": False,
+            "error": f"Failed to submit prompt to ComfyUI: {e}",
+            "timings": {
+                "comfy_ready": t_ready - t_start,
+                "prompt_submit": t_after_prompt - t_before_prompt,
+                "wait_outputs": 0.0,
+                "total": t_after_prompt - t_start,
+            },
         }
+    t_after_prompt = time.time()
+
+    # ── 4. Wait for new outputs and time the wait loop ───────────────────────────
+    t_before_wait = time.time()
+    new_images, after = _await_new_outputs(before)
+    t_after_wait = time.time()
+
+    # Log a single timing line for easy grepping in logs
+    logger.info(
+        "generate timing: comfy_ready=%.2fs prompt_submit=%.2fs wait_outputs=%.2fs total=%.2fs",
+        t_ready - t_start,
+        t_after_prompt - t_before_prompt,
+        t_after_wait - t_before_wait,
+        t_after_wait - t_start,
     )
+
+    timings = {
+        "comfy_ready": t_ready - t_start,
+        "prompt_submit": t_after_prompt - t_before_prompt,
+        "wait_outputs": t_after_wait - t_before_wait,
+        "total": t_after_wait - t_start,
+    }
+
+    # ── 5. Interpret results ─────────────────────────────────────────────────────
+    if not new_images:
+        # No new files appeared – return handler+comfy log tails so we can see why
+        comfy_log = _read_file_tail("/comfyui/user/comfyui.log") or _read_file_tail(COMFY_LOG_PATH)
+        logger.warning("generate: no new images detected; comfy log tail attached")
+        return {
+            "ok": False,
+            "error": "No new images detected after generation",
+            "prompt_response": prompt_response,
+            "comfy_log_tail": comfy_log,
+            "timings": timings,
+        }
+
+    latest_image = max(new_images, key=lambda p: after.get(p, 0))
+    logger.info(
+        "generate: new_images=%d latest=%s",
+        len(new_images),
+        latest_image,
+    )
+
+    return {
+        "ok": True,
+        "image_paths": new_images,
+        "latest_image": latest_image,
+        "prompt_response": prompt_response,
+        "timings": timings,
+    }
 
 
 def handler(event):
