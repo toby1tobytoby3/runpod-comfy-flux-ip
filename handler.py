@@ -330,8 +330,7 @@ def _handle_generate(body):
     }
 
     # ── 5. Interpret results ─────────────────────────────────────────────────────
-    if not new_images:
-        # No new files appeared – return handler+comfy log tails so we can see why
+        if not new_images:
         comfy_log = _read_file_tail("/comfyui/user/comfyui.log") or _read_file_tail(COMFY_LOG_PATH)
         logger.warning("generate: no new images detected; comfy log tail attached")
         return {
@@ -342,7 +341,9 @@ def _handle_generate(body):
             "timings": timings,
         }
 
-    latest_image = max(new_images, key=lambda p: after.get(p, 0))
+    # new_images is a list of dicts like {"path": ..., "mtime": ..., ...}
+    # pick the newest by mtime
+    latest_image = max(new_images, key=lambda img: img.get("mtime", 0))
     logger.info(
         "generate: new_images=%d latest=%s",
         len(new_images),
@@ -356,6 +357,7 @@ def _handle_generate(body):
         "prompt_response": prompt_response,
         "timings": timings,
     }
+
 
 
 def handler(event):
