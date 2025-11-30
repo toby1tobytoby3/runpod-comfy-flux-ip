@@ -1,0 +1,136 @@
+{
+  "20": {
+    "inputs": {
+      "ipadatper": "ip_adapter.safetensors",
+      "clip_vision": "model.safetensors",
+      "provider": "CUDA"
+    },
+    "class_type": "LoadFluxIPAdapter",
+    "_meta": {
+      "title": "Load Flux IP Adapter"
+    }
+  },
+  "21": {
+    "inputs": {
+      "image": "ip_ref.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "IP Reference"
+    }
+  },
+  "38": {
+    "inputs": {
+      "unet_name": "flux1-dev.safetensors",
+      "weight_dtype": "fp16",
+      "device": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Flux UNet"
+    }
+  },
+  "39": {
+    "inputs": {
+      "vae_name": "ae.safetensors",
+      "device": "default"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Flux VAE"
+    }
+  },
+  "40": {
+    "inputs": {
+      "clip_name1": "clip/clip_l.safetensors",
+      "clip_name2": "clip/t5xxl_fp8_e4m3fn.safetensors",
+      "type": "flux",
+      "device": "default"
+    },
+    "class_type": "DualCLIPLoader",
+    "_meta": {
+      "title": "Dual CLIP"
+    }
+  },
+  "41": {
+    "inputs": {
+      "text": "warmup",
+      "clip": ["40", 0]
+    },
+    "class_type": "CLIPTextEncodeFlux",
+    "_meta": {
+      "title": "Encode Prompt"
+    }
+  },
+  "42": {
+    "inputs": {
+      "conditioning": ["41", 0]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "Negative Conditioning"
+    }
+  },
+  "27": {
+    "inputs": {
+      "width": 256,
+      "height": 256,
+      "batch_size": 1
+    },
+    "class_type": "EmptySD3LatentImage",
+    "_meta": {
+      "title": "Empty Latent"
+    }
+  },
+  "43": {
+    "inputs": {
+      "ipadapter": ["20", 0],
+      "image": ["21", 0],
+      "conditioning": ["41", 0],
+      "weight": 1.0
+    },
+    "class_type": "ApplyFluxIPAdapter",
+    "_meta": {
+      "title": "Apply IP Adapter"
+    }
+  },
+  "31": {
+    "inputs": {
+      "seed": 0,
+      "steps": 1,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "model": ["38", 0],
+      "positive": ["43", 0],
+      "negative": ["42", 0],
+      "latent_image": ["27", 0],
+      "denoise": 1
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "Sampler"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": ["31", 0],
+      "vae": ["39", 0]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "Decode"
+    }
+  },
+  "9": {
+    "inputs": {
+      "images": ["8", 0],
+      "filename_prefix": "warmup",
+      "output_path": "/tmp"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Warmup"
+    }
+  }
+}
