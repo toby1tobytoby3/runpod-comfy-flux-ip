@@ -1,3 +1,4 @@
+import base64
 import importlib.util, json, logging, os, pathlib, time, subprocess, requests, runpod
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,10 @@ COMFY_LOG_PATH = os.getenv("COMFY_LOG_PATH", "/tmp/comfy.log")
 COMFY_REQUEST_TIMEOUT = float(os.getenv("COMFY_REQUEST_TIMEOUT", "60.0"))
 COMFY_OUTPUT_WAIT_SECONDS = float(os.getenv("COMFY_OUTPUT_WAIT_SECONDS", "300"))
 COMFY_OUTPUT_POLL_INTERVAL = float(os.getenv("COMFY_OUTPUT_POLL_INTERVAL", "5.0"))
+
+WARMUP_WORKFLOW_PATH = os.getenv(
+    "WARMUP_WORKFLOW_PATH", "/workspace/workflows/flux_ip_warmup.json"
+)
 
 INPUT_DIR = os.getenv("INPUT_DIR", "/runpod-volume/ComfyUI/input")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/runpod-volume/ComfyUI/output")
@@ -173,6 +178,44 @@ def _tail_file(path, max_bytes: int = 8192) -> str:
     except Exception as e:
         return f"(error reading log: {e})"
 
+
+def _load_workflow_from_path(path: pathlib.Path):
+    try:
+        with path.open("r") as f:
+            return json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load workflow at {path}: {e}")
+
+
+def _warmup_tweak(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply warmup-friendly tweaks (tiny latent, single step)."""
+
+    def _nested_set(obj, keys, value):
+        cur = obj
+        for k in keys[:-1]:
+            if not isinstance(cur, dict) or k not in cur:
+                return
+            cur = cur[k]
+        if isinstance(cur, dict) and keys[-1] in cur:
+            cur[keys[-1]] = value
+
+    tweaks = [
+        ("31", ["inputs", "steps"], 1),
+        ("31", ["inputs", "cfg"], 1.0),
+        ("31", ["inputs", "seed"], 0),
+        ("27", ["inputs", "width"], 256),
+        ("27", ["inputs", "height"], 256),
+        ("27", ["inputs", "batch_size"], 1),
+        ("9", ["inputs", "filename_prefix"], "warmup"),
+        ("9", ["inputs", "output_path"], "/tmp"),
+    ]
+
+    for node_id, keys, value in tweaks:
+        if node_id in workflow:
+            _nested_set(workflow[node_id], keys, value)
+
+    return workflow
+
 # ---------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------
@@ -235,6 +278,72 @@ def _handle_preflight():
         {
             "system_stats": stats,
             "flux_double_stream_patch": patch_info,
+        }
+    )
+
+
+def _handle_preflight_warmup(body: Dict[str, Any]):
+    """
+    Run a single-step Flux+IP workflow to load models into VRAM and trigger
+    CUDA graph compilation.
+
+    The warmup workflow can be provided inline (payload.workflow/prompt) or
+    read from WARMUP_WORKFLOW_PATH. It will be tweaked to use tiny latent
+    dimensions and a single denoise step and will save to /tmp.
+    """
+
+    _ensure_comfy_ready()
+
+    payload = body.get("payload") or {}
+    workflow = payload.get("workflow") or payload.get("prompt")
+    workflow_path = pathlib.Path(payload.get("workflow_path") or WARMUP_WORKFLOW_PATH)
+    fallback_path = pathlib.Path(__file__).resolve().parent / "workflows/flux_ip_warmup.json"
+
+    if workflow is None:
+        candidate_paths = [workflow_path, fallback_path]
+        for p in candidate_paths:
+            if p.exists():
+                workflow = _load_workflow_from_path(p)
+                workflow_path = p
+                break
+
+    if workflow is None:
+        return _fail(
+            f"Warmup workflow missing. Provide payload.workflow or create {workflow_path}"
+        )
+
+    warmup_workflow = _warmup_tweak(json.loads(json.dumps(workflow)))
+
+    before_all = _scan_outputs()
+    before = {img["path"]: img["mtime"] for img in before_all}
+
+    logger.info(
+        "preflight_warmup: submitting workflow from %s (pre-existing images=%d)",
+        workflow_path,
+        len(before),
+    )
+
+    try:
+        resp = _comfy_post("/prompt", json=warmup_workflow, timeout=600)
+        resp.raise_for_status()
+        prompt_response = resp.json()
+    except Exception as e:
+        logger.exception("preflight_warmup: failed to submit prompt")
+        return _fail(f"Warmup prompt failed: {e}")
+
+    new_images, after = _await_new_outputs(before, wait_seconds=120)
+
+    latest_image = max(new_images, key=lambda img: img.get("mtime", 0)) if new_images else None
+    logger.info(
+        "preflight_warmup: new_images=%d latest=%s", len(new_images), latest_image
+    )
+
+    return _ok(
+        {
+            "message": "Warmup executed",
+            "prompt_response": prompt_response,
+            "new_images": new_images,
+            "latest_image": latest_image,
         }
     )
 
@@ -351,10 +460,20 @@ def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
         latest_image,
     )
 
+    images_b64: List[Dict[str, str]] = []
+    if latest_image:
+        try:
+            with open(latest_image["path"], "rb") as f:
+                data = base64.b64encode(f.read()).decode("utf-8")
+            images_b64.append({"data": data, "filename": latest_image["name"]})
+        except Exception as e:
+            logger.warning("generate: failed to base64 encode latest image: %s", e)
+
     return {
         "ok": True,
         "image_paths": new_images,
         "latest_image": latest_image,
+        "images": images_b64,
         "prompt_response": prompt_response,
         "timings": timings,
     }
@@ -372,6 +491,8 @@ def handler(event):
             return _handle_ping()
         if action == "preflight":
             return _handle_preflight()
+        if action == "preflight_warmup":
+            return _handle_preflight_warmup(body)
         if action == "dump_comfy_log":
             return _handle_dump_comfy_log(body)
         if action == "list_all_outputs":
