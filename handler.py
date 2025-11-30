@@ -252,7 +252,7 @@ def _handle_list_all_outputs():
     return _ok({"images": _scan_outputs()})
 
 
-def _handle_generate(body):
+def _handle_generate(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generate an image via ComfyUI using a provided workflow/prompt.
 
@@ -330,8 +330,9 @@ def _handle_generate(body):
     }
 
     # ── 5. Interpret results ─────────────────────────────────────────────────────
-        if not new_images:
-        comfy_log = _read_file_tail("/comfyui/user/comfyui.log") or _read_file_tail(COMFY_LOG_PATH)
+    if not new_images:
+        # No new files appeared – return handler+comfy log tails so we can see why
+        comfy_log = _tail_file("/comfyui/user/comfyui.log") or _tail_file(COMFY_LOG_PATH)
         logger.warning("generate: no new images detected; comfy log tail attached")
         return {
             "ok": False,
@@ -357,7 +358,6 @@ def _handle_generate(body):
         "prompt_response": prompt_response,
         "timings": timings,
     }
-
 
 
 def handler(event):
